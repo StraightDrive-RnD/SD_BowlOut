@@ -1,0 +1,1174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0C1017">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Bowl-Out</title>
+
+<!-- Two layers of fullscreen, because one isn't enough on Android:
+     1. Fullscreen API below — works in a tab, needs a user gesture, and is
+        what you get by just opening the URL.
+     2. These meta tags — "Add to Home Screen" then launches without the
+        URL bar. For TRUE fullscreen from the home icon (no status bar
+        either) you need a real manifest.json served alongside this file:
+          { "name":"Bowl-Out", "short_name":"Bowl-Out",
+            "display":"fullscreen", "orientation":"portrait",
+            "start_url":".", "background_color":"#0C1017",
+            "theme_color":"#0C1017",
+            "icons":[{"src":"icon-192.png","sizes":"192x192","type":"image/png"},
+                     {"src":"icon-512.png","sizes":"512x512","type":"image/png"}] }
+        A data: URI manifest can't do this — Chrome rejects a start_url that
+        isn't same-origin, so it has to be a real file. -->
+
+<!-- Self-host these before you take it to a ground. Fonts over the network
+     is a bad bet on a maidan; the fallback stack below is deliberate. -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600&family=Barlow+Condensed:wght@600;700;800&family=Barlow+Semi+Condensed:wght@500;700&display=swap" rel="stylesheet">
+
+<style>
+/* ══════════════════════════════════════════════════════════════════
+   Palette: night cricket under floodlights.
+   Amber = live (mirrors the stump's breathing LED).
+   Magenta = wicket (the actual colour of Zing stumps) — and, deliberately,
+   also the colour of a broken link. Both mean "stop and look at me".
+   ══════════════════════════════════════════════════════════════════ */
+:root{
+  --night:#0C1017;
+  --panel:#161C26;
+  --line:#26303D;
+  --bone:#F2EFE6;
+  --mute:#7C8899;
+  --dot:#55616F;
+  --zing:#FF2D78;
+  --flood:#FFB020;
+
+  --disp:'Barlow Condensed','Arial Narrow',system-ui,sans-serif;
+  --body:'Barlow',system-ui,-apple-system,sans-serif;
+  --data:'Barlow Semi Condensed','Arial Narrow',system-ui,sans-serif;
+}
+
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+/* A class with an explicit display beats the UA sheet's [hidden] rule.
+   Several here do. Settle it once. */
+[hidden]{display:none!important}
+html,body{height:100%}
+/* The fullscreen element gets a black backdrop by default; make it ours so
+   there's no flash of black at the edges on entry. */
+html:fullscreen,html:fullscreen body{background:var(--night)}
+body{
+  background:var(--night);color:var(--bone);font-family:var(--body);
+  overscroll-behavior:none;user-select:none;
+}
+.app{
+  height:100%;max-width:520px;margin:0 auto;
+  display:flex;flex-direction:column;
+  padding:max(env(safe-area-inset-top),6px) 20px max(env(safe-area-inset-bottom),6px);
+}
+
+/* ── Status strip: back, link state, always reachable ────────────── */
+.strip{
+  display:flex;align-items:center;gap:8px;
+  padding:10px 0 10px;border-bottom:1px solid var(--line);
+  flex:0 0 auto;
+}
+.iconbtn{
+  background:none;border:0;color:var(--mute);cursor:pointer;
+  width:32px;height:32px;display:grid;place-items:center;margin-left:-8px;
+  border-radius:2px;flex:0 0 auto;
+}
+.iconbtn svg{width:20px;height:20px}
+.iconbtn:active{color:var(--bone)}
+.iconbtn.right{margin-left:2px;margin-right:-8px}
+.iconbtn:focus-visible,.devbtn:focus-visible{outline:2px solid var(--flood);outline-offset:2px}
+.devbtn{
+  display:flex;align-items:center;gap:9px;
+  background:none;border:0;cursor:pointer;padding:6px 4px;
+  font-family:var(--data);font-size:12px;letter-spacing:.14em;
+  text-transform:uppercase;color:var(--mute);
+}
+.pip{width:7px;height:7px;border-radius:50%;background:var(--dot);flex:0 0 auto}
+.pip.live{background:var(--flood);box-shadow:0 0 8px var(--flood)}
+.pip.busy{background:var(--mute);animation:blink .5s steps(1,end) infinite}
+.pip.lost{background:var(--zing);box-shadow:0 0 8px var(--zing)}
+@keyframes blink{50%{opacity:.15}}
+.strip .spacer{margin-left:auto}
+#link{
+  font-family:var(--data);font-size:12px;letter-spacing:.14em;
+  text-transform:uppercase;color:var(--mute);
+}
+#link.lost{color:var(--zing)}
+#link.live{color:var(--flood)}
+
+/* ── Screens ────────────────────────────────────────────────────── */
+.screen{flex:1;display:none;flex-direction:column;min-height:0}
+.screen.show{display:flex}
+
+.eyebrow{
+  font-family:var(--data);font-size:12px;font-weight:700;
+  letter-spacing:.2em;text-transform:uppercase;color:var(--mute);
+}
+h1{
+  font-family:var(--disp);font-weight:800;
+  font-size:clamp(38px,12vw,58px);line-height:.92;
+  letter-spacing:-.01em;text-transform:uppercase;
+}
+.lede{color:var(--mute);font-size:15px;line-height:1.5;max-width:34ch}
+
+/* ── Buttons ────────────────────────────────────────────────────── */
+.btn{
+  font-family:var(--disp);font-weight:800;font-size:26px;
+  letter-spacing:.06em;text-transform:uppercase;
+  background:var(--bone);color:var(--night);
+  border:0;border-radius:2px;padding:20px;width:100%;cursor:pointer;
+  transition:transform .06s ease, opacity .15s ease;
+}
+.btn:active{transform:scale(.985)}
+.btn:disabled{opacity:.28;cursor:default}
+.btn.live{background:var(--flood);color:var(--night)}
+.btn.alarm{background:var(--zing);color:#fff}
+.btn.ghost{background:transparent;color:var(--bone);border:1px solid var(--line);font-size:18px;padding:14px}
+.btn.quiet{background:transparent;color:var(--mute);border:0;font-size:15px;padding:10px;letter-spacing:.16em}
+.btn:focus-visible{outline:2px solid var(--flood);outline-offset:3px}
+.stack{display:flex;flex-direction:column;gap:10px}
+
+/* ── Home / link ────────────────────────────────────────────────── */
+#home{justify-content:center;gap:22px}
+
+/* ── Roster ─────────────────────────────────────────────────────── */
+#roster{padding-top:26px;gap:16px}
+.field{display:flex;gap:8px}
+.field input{
+  flex:1;background:var(--panel);border:1px solid var(--line);border-radius:2px;
+  color:var(--bone);font-family:var(--disp);font-size:22px;font-weight:700;
+  text-transform:uppercase;letter-spacing:.03em;padding:12px 14px;min-width:0;
+}
+.field input:focus{outline:none;border-color:var(--flood)}
+.field button{
+  background:var(--panel);border:1px solid var(--line);color:var(--bone);
+  font-family:var(--disp);font-size:22px;font-weight:800;width:56px;
+  border-radius:2px;cursor:pointer;
+}
+.list{flex:1;overflow-y:auto;min-height:0;margin:0 -4px;padding:0 4px}
+.row{display:flex;align-items:center;gap:12px;padding:13px 0;border-bottom:1px solid var(--line)}
+.row .n{font-family:var(--data);font-size:12px;color:var(--mute);width:20px;font-weight:700}
+.row .nm{font-family:var(--disp);font-size:24px;font-weight:700;text-transform:uppercase;flex:1}
+.row .x{background:none;border:0;color:var(--dot);font-size:22px;cursor:pointer;padding:0 4px}
+
+/* ── Play ───────────────────────────────────────────────────────── */
+#play{padding-top:14px}
+.who{display:flex;align-items:baseline;gap:12px;margin-bottom:2px}
+.who .eyebrow{flex:1}
+.who .tally{font-family:var(--disp);font-size:26px;font-weight:800;color:var(--flood)}
+
+.stage{flex:1;display:grid;place-items:center;min-height:0;padding:12px 0}
+.ball{position:relative;width:min(58vw,230px);aspect-ratio:1}
+.ball svg{position:absolute;inset:0;width:100%;height:100%;transform:rotate(-90deg)}
+.ball .track{fill:none;stroke:var(--line);stroke-width:3}
+.ball .drain{fill:none;stroke:var(--flood);stroke-width:3;stroke-linecap:butt}
+.ball .face{
+  position:absolute;inset:14px;border-radius:50%;border:2px solid var(--line);
+  display:grid;place-items:center;transition:background .12s, border-color .12s;
+}
+.ball .val{font-family:var(--disp);font-weight:800;font-size:78px;line-height:1;font-variant-numeric:tabular-nums}
+.ball[data-s="ready"] .face{border-color:var(--line)}
+.ball[data-s="ready"] .val{color:var(--mute);font-size:20px;letter-spacing:.2em}
+.ball[data-s="armed"] .face{border-color:var(--flood);animation:breathe 2s ease-in-out infinite}
+.ball[data-s="armed"] .val{color:var(--flood)}
+.ball[data-s="hit"]  .face{background:var(--zing);border-color:var(--zing)}
+.ball[data-s="hit"]  .val{color:#fff;font-size:100px}
+.ball[data-s="miss"] .face{border-color:var(--dot)}
+.ball[data-s="miss"] .val{color:var(--dot);font-size:100px}
+/* Mirrors the 2 s triangle the firmware runs on the stump LED. Same
+   rhythm on the phone and on the box. */
+@keyframes breathe{
+  0%,100%{box-shadow:0 0 0 0 rgba(255,176,32,.06)}
+  50%    {box-shadow:0 0 0 14px rgba(255,176,32,0)}
+}
+
+.over{display:flex;gap:8px;justify-content:center;padding:6px 0 12px}
+.b{
+  width:38px;height:38px;border-radius:50%;border:1.5px solid var(--line);
+  display:grid;place-items:center;font-family:var(--disp);font-weight:800;
+  font-size:19px;color:transparent;cursor:pointer;transition:all .15s;
+}
+.b[data-s="hit"]{background:var(--zing);border-color:var(--zing);color:#fff}
+.b[data-s="miss"]{color:var(--dot);font-size:26px}
+.b[data-s="now"]{border-color:var(--flood);box-shadow:inset 0 0 0 3px rgba(255,176,32,.18)}
+
+.subrow{min-height:46px;display:grid;place-items:center;padding-bottom:10px}
+.hint{
+  font-family:var(--data);font-size:11px;letter-spacing:.14em;
+  text-transform:uppercase;color:var(--dot);text-align:center;min-height:16px;
+}
+/* Deliberately quiet. This button ends the ball, so it must be reachable
+   in one tap but never the thing your thumb finds by accident. It stays
+   slate, not amber — a dot is the absence of an event, not a live one. */
+.btn.mini{
+  width:auto;padding:9px 30px;font-size:15px;letter-spacing:.16em;
+  background:transparent;color:var(--mute);border:1px solid var(--line);
+}
+.btn.mini:active{transform:scale(.96)}
+
+.ticker{
+  flex:0 0 auto;border-top:1px solid var(--line);padding:12px 0 14px;
+  display:flex;gap:16px;overflow-x:auto;
+  font-family:var(--data);font-size:13px;letter-spacing:.08em;
+  text-transform:uppercase;color:var(--mute);scrollbar-width:none;
+}
+.ticker::-webkit-scrollbar{display:none}
+.ticker span{white-space:nowrap}
+.ticker b{color:var(--bone);font-weight:700}
+.ticker .lead b{color:var(--flood)}
+
+/* ── Results ────────────────────────────────────────────────────── */
+#results{padding-top:24px;gap:14px}
+.podium{flex:1;overflow-y:auto;min-height:0}
+.res{display:flex;align-items:center;gap:14px;padding:14px 0;border-bottom:1px solid var(--line)}
+.res .pos{font-family:var(--disp);font-size:30px;font-weight:800;color:var(--dot);width:34px}
+.res.win .pos{color:var(--flood)}
+.res .nm{font-family:var(--disp);font-size:28px;font-weight:700;text-transform:uppercase;flex:1}
+.res .mini2{display:flex;gap:4px}
+.res .mini2 i{width:9px;height:9px;border-radius:50%;background:var(--line)}
+.res .mini2 i.h{background:var(--zing)}
+.res .sc{font-family:var(--disp);font-size:30px;font-weight:800;width:52px;text-align:right}
+.res .rt{font-family:var(--data);font-size:12px;color:var(--mute);width:56px;text-align:right;line-height:1.3}
+
+/* ── Zing flash: screen and stump strobe together ───────────────── */
+#zing{position:fixed;inset:0;background:var(--zing);pointer-events:none;opacity:0;z-index:60}
+#zing.go{animation:strobe .42s steps(1,end)}
+@keyframes strobe{
+  0%,20%,40%{opacity:.9}
+  10%,30%,50%{opacity:0}
+  100%{opacity:0}
+}
+
+/* ── Link banner. Tappable — a dead end is the bug we're fixing. ── */
+#drop{
+  position:fixed;left:0;right:0;top:0;z-index:70;
+  background:var(--zing);color:#fff;border:0;width:100%;cursor:pointer;
+  font-family:var(--data);font-size:13px;font-weight:700;
+  letter-spacing:.12em;text-transform:uppercase;
+  padding:calc(max(env(safe-area-inset-top),6px) + 10px) 16px 10px;
+  text-align:center;transform:translateY(-100%);
+  visibility:hidden;pointer-events:none;
+  transition:transform .2s, visibility .2s;
+}
+#drop.show{transform:none;visibility:visible;pointer-events:auto}
+#drop.busy{background:var(--panel);color:var(--mute);border-bottom:1px solid var(--line)}
+
+@media (prefers-reduced-motion:reduce){
+  *{animation:none!important;transition:none!important}
+  #zing.go{opacity:.9}
+}
+</style>
+</head>
+<body>
+
+<button id="drop"></button>
+<div id="zing"></div>
+
+<div class="app">
+
+  <div class="strip">
+    <button class="iconbtn" id="btnBack" aria-label="Back" hidden>
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 4L7 12l8 8" fill="none"
+        stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </button>
+    <button class="devbtn" id="btnDev">
+      <span class="pip" id="pip"></span>
+      <span id="devname">No stump</span>
+    </button>
+    <span class="spacer"></span>
+    <span id="link"></span>
+    <button class="iconbtn right" id="btnFs" aria-label="Full screen" hidden>
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path id="fsIcon" d=""
+        fill="none" stroke="currentColor" stroke-width="2"
+        stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </button>
+  </div>
+
+  <!-- ── Home: the link lives here, and every screen can get back to it ── -->
+  <section class="screen show" id="home">
+    <div class="eyebrow">Digital stump</div>
+    <h1>Bowl<br>Out</h1>
+    <p class="lede" id="homeMsg"></p>
+    <div class="stack">
+      <button class="btn" id="btnPrimary"></button>
+      <button class="btn ghost" id="btnSecondary" hidden></button>
+      <button class="btn quiet" id="btnTertiary" hidden></button>
+    </div>
+  </section>
+
+  <!-- ── Roster ───────────────────────────────────────────────────── -->
+  <section class="screen" id="roster">
+    <div class="eyebrow">Who's bowling</div>
+    <div class="field">
+      <input id="nameIn" placeholder="Add a name" maxlength="14" autocomplete="off" enterkeyhint="done">
+      <button id="btnAdd" aria-label="Add player">+</button>
+    </div>
+    <div class="list" id="rlist"></div>
+    <button class="btn" id="btnStart" disabled>Start game</button>
+  </section>
+
+  <!-- ── Play ─────────────────────────────────────────────────────── -->
+  <section class="screen" id="play">
+    <div class="who">
+      <span class="eyebrow" id="pos">Bowler 1 of 3</span>
+      <span class="tally" id="tally">0</span>
+    </div>
+    <h1 id="bowler">—</h1>
+
+    <div class="stage">
+      <div class="ball" id="ball" data-s="ready">
+        <svg viewBox="0 0 100 100" aria-hidden="true">
+          <circle class="track" cx="50" cy="50" r="46"></circle>
+          <circle class="drain" cx="50" cy="50" r="46" id="drain"
+                  stroke-dasharray="289.03" stroke-dashoffset="289.03"></circle>
+        </svg>
+        <div class="face"><span class="val" id="bval">Ready</span></div>
+      </div>
+    </div>
+
+    <div class="over" id="over"></div>
+    <div class="subrow">
+      <div class="hint" id="hint">Hold a ball to change it</div>
+      <button class="btn mini" id="btnMissed" hidden>Missed</button>
+    </div>
+    <button class="btn" id="btnBowl">Bowl</button>
+
+    <div class="ticker" id="ticker"></div>
+  </section>
+
+  <!-- ── Results ──────────────────────────────────────────────────── -->
+  <section class="screen" id="results">
+    <div class="eyebrow" id="rhead">Final</div>
+    <h1 id="rwin">—</h1>
+    <div class="podium" id="podium"></div>
+    <button class="btn" id="btnAgain">New game</button>
+  </section>
+
+</div>
+
+<script>
+'use strict';
+
+/* ══════════════════════════════════════════════════════════════════
+   Protocol — must match firmware/main/stump_ble.c
+   ══════════════════════════════════════════════════════════════════ */
+const UUID = {
+  svc:  'a7b10001-8c2f-4d3a-9e6b-1f2a3b4c5d6e',
+  hit:  'a7b10002-8c2f-4d3a-9e6b-1f2a3b4c5d6e',
+  ctrl: 'a7b10003-8c2f-4d3a-9e6b-1f2a3b4c5d6e',
+  stat: 'a7b10004-8c2f-4d3a-9e6b-1f2a3b4c5d6e',
+};
+const CMD = { ARM:1, DISARM:2, THRESH:3, LEDTEST:4, CELEBRATE:5, STATUS:6 };
+const WINDOW_MS = 20000;
+const BALLS = 6;
+
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+/* ══════════════════════════════════════════════════════════════════
+   Fullscreen
+
+   A scoreboard held at arm's length on a maidan has no use for a URL bar,
+   and every pixel of the countdown is worth having. Two ways in:
+
+     - requestFullscreen(), taken on the first tap. It needs a user gesture,
+       so it cannot happen on load however much we'd like it to.
+     - "Add to Home Screen", via the meta tags in <head>.
+
+   Portrait is locked because the layout genuinely does not survive landscape
+   on a phone: the stage would have ~180 px of height to work with once the
+   strip, name, over strip and buttons have taken theirs.
+
+   Note the interaction with the back button: Android's system back exits
+   fullscreen before it navigates, so the first press does nothing visible
+   except restore the browser chrome. That is Chrome's behaviour and fighting
+   it would be worse. It's also a good argument for the on-screen back button,
+   which always navigates.
+   ══════════════════════════════════════════════════════════════════ */
+const FS_ICON = {
+  enter:'M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5',
+  exit: 'M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5',
+};
+const fsOK = !!document.documentElement.requestFullscreen;
+
+const fs = {
+  on: () => !!document.fullscreenElement,
+
+  async enter(){
+    try { await document.documentElement.requestFullscreen({ navigationUI:'hide' }); }
+    catch { return; }
+    /* Only permitted while fullscreen, and only on mobile. Throws on
+       desktop Chrome — not a problem, just not a thing there. */
+    try { await screen.orientation.lock('portrait'); } catch {}
+  },
+
+  async exit(){
+    try { screen.orientation.unlock(); } catch {}
+    try { await document.exitFullscreen(); } catch {}
+  },
+
+  toggle(){ this.on() ? this.exit() : this.enter(); },
+
+  paint(){
+    $('btnFs').hidden = !fsOK;
+    $('fsIcon').setAttribute('d', this.on() ? FS_ICON.exit : FS_ICON.enter);
+    $('btnFs').setAttribute('aria-label', this.on() ? 'Leave full screen' : 'Full screen');
+  },
+};
+
+document.addEventListener('fullscreenchange', () => fs.paint());
+$('btnFs').onclick = () => fs.toggle();
+
+/* Once, on the first touch anywhere. If they deliberately leave fullscreen
+   we don't drag them back in — {once:true} means we ask exactly one time
+   per page load. Launched from the home screen? Already chromeless; don't
+   bother. */
+if(fsOK){
+  document.addEventListener('pointerdown', () => {
+    if(matchMedia('(display-mode: fullscreen)').matches) return;
+    fs.enter();
+  }, { once:true });
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   Navigation — hub and spoke, home is the hub.
+   Every screen is one hop from the link controls. That is the whole
+   point: a stump that dies must never leave you on a screen with no
+   way to fix it.
+   ══════════════════════════════════════════════════════════════════ */
+let screenNow = 'home';
+let navDepth = 0;
+
+function render(id){
+  screenNow = id;
+  document.querySelectorAll('.screen').forEach(s => s.classList.toggle('show', s.id === id));
+  $('btnBack').hidden = navDepth === 0;
+  if(id === 'home')    paintHome();
+  if(id === 'roster')  paintRoster();
+  if(id === 'play')    paint();
+  paintLink();
+  /* The banner's visibility depends on which screen we're on, so it has to
+     be repainted on every navigation — not only when the link changes. */
+  paintBanner();
+}
+
+function nav(id, replace){
+  if(id === screenNow && !replace) return;
+  if(replace) history.replaceState({ screen:id, d:navDepth }, '');
+  else        history.pushState({ screen:id, d:++navDepth }, '');
+  render(id);
+}
+
+/* The on-screen back button and the Android system back button are the
+   same code path, so they can never disagree. At depth 0 the system back
+   leaves the app, which is what it should do. */
+window.addEventListener('popstate', e => {
+  navDepth = e.state?.d ?? 0;
+  render(e.state?.screen ?? 'home');
+});
+$('btnBack').onclick = () => history.back();
+$('btnDev').onclick  = () => nav('home');
+
+/* ══════════════════════════════════════════════════════════════════
+   Link state machine
+   ══════════════════════════════════════════════════════════════════ */
+const LINK = {
+  IDLE:'idle',                 /* no stump chosen yet                    */
+  CONNECTING:'connecting',     /* first connect, user is waiting         */
+  CONNECTED:'connected',
+  RECONNECTING:'reconnecting', /* dropped, climbing back automatically   */
+  LOST:'lost',                 /* gave up — manual action required       */
+};
+
+const MAX_AUTO_TRIES = 8;      /* ~35 s of backoff, then hand it over    */
+
+const ble = {
+  dev:null, ctrl:null, state:LINK.IDLE, attempt:0, timer:0, lastSeq:null,
+
+  set(s){ this.state = s; paintLink(); if(screenNow === 'home') paintHome(); paintBanner(); },
+
+  /* Show the picker. Also the escape hatch when a stump handle has gone
+     stale (phone Bluetooth toggled, wrong box, whatever). */
+  async pick(){
+    this.stop();
+    try {
+      const d = await navigator.bluetooth.requestDevice({ filters:[{ services:[UUID.svc] }] });
+      this.attach(d);
+      this.set(LINK.CONNECTING);
+      await this.open();
+    } catch(err){
+      this.set(this.dev ? LINK.LOST : LINK.IDLE);
+      $('homeMsg').textContent = err.name === 'NotFoundError'
+        ? 'No stump picked. Power it on — the status light blinks fast until a phone finds it — then try again.'
+        : 'Could not connect: ' + err.message;
+    }
+  },
+
+  attach(d){
+    if(this.dev === d) return;
+    this.dev = d;
+    d.addEventListener('gattserverdisconnected', () => this.dropped());
+  },
+
+  async open(){
+    const srv = await this.dev.gatt.connect();
+    const s   = await srv.getPrimaryService(UUID.svc);
+    this.ctrl = await s.getCharacteristic(UUID.ctrl);
+
+    const hit = await s.getCharacteristic(UUID.hit);
+    hit.addEventListener('characteristicvaluechanged', e => onHit(e.target.value));
+    await hit.startNotifications();
+
+    const st = await s.getCharacteristic(UUID.stat);
+    st.addEventListener('characteristicvaluechanged', e => onStatus(e.target.value));
+    await st.startNotifications();
+
+    /* A stump that lost power has rebooted: its seq counter restarted at 0
+       and its uptime clock with it. Forget what we knew or the next packet
+       looks like a 250-packet gap. */
+    this.lastSeq = null;
+    this.attempt = 0;
+    this.set(LINK.CONNECTED);
+
+    /* Resync rather than assume. If we thought a ball was live, it isn't —
+       the firmware failsafe disarmed it, or the reboot did. */
+    try { await this.send([CMD.STATUS]); } catch {}
+    if(game && game.phase === 'armed') abortBall();
+    keepAwake();
+  },
+
+  async send(bytes){
+    if(this.state !== LINK.CONNECTED) return false;
+    try {
+      await this.ctrl.writeValueWithResponse(new Uint8Array(bytes));
+      return true;
+    } catch(err){
+      console.warn('write failed', err);
+      return false;
+    }
+  },
+
+  arm(ballId){ return this.send([CMD.ARM, ballId & 0xFF, WINDOW_MS & 0xFF, WINDOW_MS >> 8]); },
+  disarm(){ return this.send([CMD.DISARM]); },
+
+  dropped(){
+    if(this.state === LINK.IDLE) return;
+    this.ctrl = null;
+    /* A drop mid-over must not destroy the game — the board is in
+       localStorage and the firmware disarms itself. Just climb back. */
+    if(game && game.phase === 'armed') abortBall();
+    this.attempt = 0;
+    this.set(LINK.RECONNECTING);
+    this.retry();
+  },
+
+  retry(){
+    clearTimeout(this.timer);
+    if(this.state !== LINK.RECONNECTING && this.state !== LINK.CONNECTING) return;
+
+    if(this.attempt >= MAX_AUTO_TRIES){
+      /* Stop rather than loop forever in the background. Someone has gone
+         to find the power lead; they'll be a couple of minutes. Give them
+         a button instead of a spinner. */
+      this.set(LINK.LOST);
+      return;
+    }
+    const wait = Math.min(800 * 2 ** this.attempt, 5000);
+    this.attempt++;
+    paintLink(); paintBanner(); if(screenNow === 'home') paintHome();
+
+    this.timer = setTimeout(async () => {
+      try { await this.open(); }
+      catch { this.retry(); }
+    }, wait);
+  },
+
+  /* Manual "Reconnect": start the clock over, no picker. */
+  async retryNow(){
+    if(!this.dev) return this.pick();
+    this.attempt = 0;
+    this.set(LINK.RECONNECTING);
+    try { await this.open(); }
+    catch { this.retry(); }
+  },
+
+  stop(){
+    clearTimeout(this.timer);
+    if(this.state === LINK.RECONNECTING || this.state === LINK.CONNECTING){
+      this.set(LINK.LOST);
+    }
+  },
+
+  forget(){
+    clearTimeout(this.timer);
+    try { this.dev?.gatt?.disconnect(); } catch {}
+    this.dev = null; this.ctrl = null; this.lastSeq = null;
+    this.set(LINK.IDLE);
+  },
+};
+
+/* ══════════════════════════════════════════════════════════════════
+   Game state
+   ══════════════════════════════════════════════════════════════════ */
+const SAVE = 'bowlout.v1';
+let game = null;
+let armedBallId = null;   /* echoed back by the device; guards late packets */
+let armedAt = 0;
+let rafId = 0;
+let windowTimer = 0;
+let settleTimer = 0;
+let lastHit = null;
+
+/* The operator can call a miss before the ball has finished arriving. The
+   stump fires its LED ~1 ms after impact but the app only hears about it
+   ~190 ms later (120 ms FIFO settle + ~70 ms I2C scan + link latency), so
+   there is a real window where a thumb beats the packet.
+   If that happens, the box has physically flashed a wicket and the board
+   must not disagree with it. A late hit for the same ball inside this grace
+   overrides the manual miss. Set to 0 to make the operator always final. */
+const LATE_HIT_GRACE_MS = 500;
+let manualMissAt = 0;
+let manualMissBall = null;
+
+function newGame(names){
+  return {
+    players: names.map(n => ({ name:n, balls:Array(BALLS).fill(null), times:[], peaks:[] })),
+    p:0, b:0, phase:'ready', seq:0, sudden:false,
+  };
+}
+const save = () => { try{ localStorage.setItem(SAVE, JSON.stringify(game)); }catch{} };
+const load = () => { try{ return JSON.parse(localStorage.getItem(SAVE)); }catch{ return null; } };
+const cur  = () => game.players[game.p];
+const hits = p => p.balls.filter(v => v === 'W').length;
+const avgRt = p => p.times.length ? Math.round(p.times.reduce((a,b)=>a+b,0) / p.times.length) : null;
+const bestPeak = p => p.peaks?.length ? Math.max(...p.peaks) : null;
+const liveGame = () => !!game && game.phase !== 'done';
+
+/* ══════════════════════════════════════════════════════════════════
+   Device events
+   ══════════════════════════════════════════════════════════════════ */
+function onStatus(dv){
+  const state = dv.getUint8(0);
+  const peak  = dv.getUint16(6, true);
+  if(state === 3){                     /* STUMP_ERROR */
+    $('homeMsg').textContent = 'The stump reports a sensor fault — its status light is blinking fast and steady. Power-cycle it.';
+  }
+  if(peak) console.log(`status: state=${state} last_peak=${(peak/1000).toFixed(2)}g`);
+}
+
+function onHit(dv){
+  /* 20-byte HIT_EVENT. Offsets 12-19 are the node's waveform features,
+     same units and thresholds as the autoscoring rig. */
+  const h = {
+    seq:      dv.getUint8(1),
+    ballId:   dv.getUint8(2),
+    uptimeMs: dv.getUint32(3, true),
+    sinceArm: dv.getUint16(7, true),
+    peakMg:   dv.getUint16(9, true),
+    armed:    dv.getUint8(11) & 0x01,
+    rise:     dv.getUint8(12),   /* samples from threshold cross to peak  */
+    dur:      dv.getUint8(13),   /* samples above the 2 g event threshold */
+    osc:      dv.getUint8(14),   /* re-crossings = ring / rebound         */
+    impulse:  dv.getUint16(15, true),
+    nSamples: dv.getUint16(17, true),
+    wakeSrc:  dv.getUint8(19),
+  };
+
+  if(ble.lastSeq !== null){
+    const gap = (h.seq - ble.lastSeq + 256) % 256;
+    if(gap > 1) console.warn(`dropped ${gap-1} hit packet(s)`);
+  }
+  ble.lastSeq = h.seq;
+  lastHit = h;
+
+  /* At 417 Hz a sample is 2.4 ms. Report in both so the numbers you read
+     here line up with the thresholds you tuned in samples. */
+  console.log(`HIT peak=${(h.peakMg/1000).toFixed(2)}g rise=${h.rise}sa/${(h.rise*2.4).toFixed(0)}ms ` +
+              `dur=${h.dur}sa/${(h.dur*2.4).toFixed(0)}ms osc=${h.osc} imp=${h.impulse} ` +
+              `n=${h.nSamples} src=${h.wakeSrc.toString(2).padStart(3,'0')} armed=${h.armed}`);
+
+  /* Knocks while nobody is bowling: not a wicket, just the box being
+     carried around. Kept for calibration, never scored. */
+  if(!h.armed) return;
+
+  /* Operator called it missed, then the ball landed. The stump flashed —
+     agree with the box. */
+  if(h.ballId === manualMissBall &&
+     performance.now() - manualMissAt < LATE_HIT_GRACE_MS){
+    promoteLateHit(h);
+    return;
+  }
+
+  /* A hit for a ball we've already moved past — arrived late, or a
+     duplicate. Never let it score. */
+  if(game?.phase !== 'armed' || h.ballId !== armedBallId) return;
+
+  resolveBall('W', h.sinceArm, h);
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   Ball lifecycle
+   ══════════════════════════════════════════════════════════════════ */
+async function bowl(){
+  if(game.phase !== 'ready') return;
+  if(ble.state !== LINK.CONNECTED){
+    $('hint').textContent = 'Stump offline';
+    return;
+  }
+  armedBallId = game.seq & 0xFF;
+  manualMissBall = null;
+
+  const ok = await ble.arm(armedBallId);
+  if(!ok){
+    $('hint').textContent = 'Could not reach the stump';
+    return;
+  }
+
+  game.phase = 'armed';
+  armedAt = performance.now();
+  save();
+
+  /* App-side backstop only. The firmware runs its own failsafe timer, so
+     the box is never left armed even if this page dies. */
+  clearTimeout(windowTimer);
+  windowTimer = setTimeout(() => {
+    if(game.phase === 'armed') resolveBall('.', null, null);
+  }, WINDOW_MS + 400);
+
+  paint();
+  tick();
+}
+
+function abortBall(){
+  clearTimeout(windowTimer);
+  clearTimeout(settleTimer);
+  cancelAnimationFrame(rafId);
+  if(game) game.phase = 'ready';
+  if(screenNow === 'play') paint();
+}
+
+/* Screen strobe, timed to the firmware's 3 x 60 ms MOSFET strobe. */
+function flashZing(){
+  $('zing').classList.remove('go');
+  void $('zing').offsetWidth;
+  $('zing').classList.add('go');
+  if(navigator.vibrate) navigator.vibrate([40,50,40,50,90]);
+}
+
+function resolveBall(val, rtMs, h, manual){
+  clearTimeout(windowTimer);
+  clearTimeout(settleTimer);
+  cancelAnimationFrame(rafId);
+  ble.disarm();                     /* closes the window on the box now */
+
+  const p = cur();
+  p.balls[game.b] = val;
+  if(val === 'W' && rtMs != null) p.times.push(rtMs);
+  if(val === 'W' && h) (p.peaks ||= []).push(h.peakMg);
+
+  manualMissBall = manual ? armedBallId : null;
+  if(manual) manualMissAt = performance.now();
+
+  game.phase = 'settling';
+  game.seq = (game.seq + 1) & 0xFF;
+  save();
+
+  if(val === 'W'){
+    flashZing();
+    /* Peak and reaction are the crowd-facing numbers. rise/dur/osc are
+       here because you will want them at the ground while calibrating,
+       and adding a settings screen for that is not worth a round trip. */
+    $('hint').textContent = h
+      ? `${(h.peakMg/1000).toFixed(1)}g · ${(rtMs/1000).toFixed(1)}s · r${h.rise} d${h.dur} o${h.osc}`
+      : '';
+  } else {
+    if(navigator.vibrate) navigator.vibrate(18);
+    $('hint').textContent = manual ? 'Called missed' : 'Missed';
+  }
+
+  paint();
+  settleTimer = setTimeout(nextBall, val === 'W' ? 1600 : 1000);
+}
+
+/* Manual miss, then the ball actually landed. Rewrite the dot to a W —
+   seq already advanced in resolveBall, so don't touch it here. */
+function promoteLateHit(h){
+  if(game.phase !== 'settling') return;
+  clearTimeout(settleTimer);
+  manualMissBall = null;
+
+  const p = cur();
+  p.balls[game.b] = 'W';
+  p.times.push(h.sinceArm);
+  (p.peaks ||= []).push(h.peakMg);
+  save();
+
+  flashZing();
+  $('hint').textContent = 'Stump flashed — given W';
+  paint();
+  settleTimer = setTimeout(nextBall, 1600);
+}
+
+function nextBall(){
+  game.b++;
+  if(game.b >= BALLS){
+    game.b = 0;
+    game.p++;
+    if(game.p >= game.players.length) return finish();
+  }
+  game.phase = 'ready';
+  save();
+  paint();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   Countdown ring
+   ══════════════════════════════════════════════════════════════════ */
+const CIRC = 2 * Math.PI * 46;
+
+function tick(){
+  if(!game || game.phase !== 'armed') return;
+  const left = Math.max(0, WINDOW_MS - (performance.now() - armedAt));
+  $('drain').style.strokeDashoffset = CIRC * (1 - left / WINDOW_MS);
+  $('bval').textContent = Math.ceil(left / 1000);
+  rafId = requestAnimationFrame(tick);
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   Link painting
+   ══════════════════════════════════════════════════════════════════ */
+const LINK_WORD = {
+  [LINK.IDLE]:'', [LINK.CONNECTING]:'Finding', [LINK.CONNECTED]:'Live',
+  [LINK.RECONNECTING]:'Retrying', [LINK.LOST]:'Lost',
+};
+
+function paintLink(){
+  const s = ble.state;
+  $('pip').className = 'pip ' + (
+    s === LINK.CONNECTED ? 'live' :
+    s === LINK.LOST      ? 'lost' :
+    s === LINK.IDLE      ? ''     : 'busy');
+  $('devname').textContent = ble.dev ? (ble.dev.name || 'Stump') : 'No stump';
+  const l = $('link');
+  l.textContent = LINK_WORD[s];
+  l.className = s === LINK.CONNECTED ? 'live' : s === LINK.LOST ? 'lost' : '';
+}
+
+/* The banner exists so a broken link is never a dead end on the play
+   screen. Tapping it goes home, where the buttons are. */
+function paintBanner(){
+  const b = $('drop'), s = ble.state;
+  const show = screenNow !== 'home' && s !== LINK.CONNECTED && s !== LINK.IDLE;
+  b.classList.toggle('show', show);
+  b.classList.toggle('busy', s === LINK.RECONNECTING || s === LINK.CONNECTING);
+  b.textContent = s === LINK.RECONNECTING
+    ? `Reconnecting to the stump · try ${ble.attempt} of ${MAX_AUTO_TRIES}`
+    : s === LINK.LOST ? 'Stump lost — tap to reconnect' : 'Connecting…';
+}
+$('drop').onclick = () => nav('home');
+
+/* ══════════════════════════════════════════════════════════════════
+   Home
+   ══════════════════════════════════════════════════════════════════ */
+function startFresh(){
+  localStorage.removeItem(SAVE);
+  game = null;
+  names = [];
+  nav('roster');
+}
+
+function paintHome(){
+  const P = $('btnPrimary'), S = $('btnSecondary'), T = $('btnTertiary');
+  [P,S,T].forEach(b => { b.hidden = true; b.disabled = false; b.className = b.dataset.base; });
+  const msg = $('homeMsg');
+  const name = ble.dev?.name || 'the stump';
+
+  if(!navigator.bluetooth){
+    msg.textContent = 'This browser has no Bluetooth. Open it in Chrome on Android — Safari and every iOS browser block the API outright. You can still keep the board by hand.';
+    P.hidden = false; P.textContent = 'Connect stump'; P.disabled = true;
+    if(liveGame()){ S.hidden = false; S.textContent = 'Open the board'; S.onclick = () => nav('play'); }
+    return;
+  }
+
+  switch(ble.state){
+  case LINK.CONNECTED:
+    msg.textContent = `Connected to ${name}. Six balls each — hit the stump, take the wicket.`;
+    if(liveGame()){
+      P.hidden = false; P.textContent = `Resume · ${cur().name}`; P.onclick = () => nav('play');
+      S.hidden = false; S.textContent = 'New game'; S.onclick = startFresh;
+    } else {
+      P.hidden = false; P.textContent = 'New game'; P.onclick = startFresh;
+    }
+    T.hidden = false; T.textContent = 'Disconnect'; T.onclick = () => ble.forget();
+    break;
+
+  case LINK.CONNECTING:
+  case LINK.RECONNECTING:
+    msg.textContent = ble.state === LINK.CONNECTING
+      ? `Connecting to ${name}…`
+      : `Lost ${name}. Trying again — attempt ${ble.attempt} of ${MAX_AUTO_TRIES}. Check its power; the status light blinks fast when it's looking for a phone.`;
+    P.hidden = false; P.disabled = true;
+    P.textContent = ble.state === LINK.CONNECTING ? 'Connecting…' : `Retrying · ${ble.attempt}`;
+    S.hidden = false; S.textContent = 'Stop trying'; S.onclick = () => ble.stop();
+    break;
+
+  case LINK.LOST:
+    msg.textContent = `Can't reach ${name}. Power it back on and reconnect — the board is saved either way.`;
+    P.hidden = false; P.className = 'btn alarm'; P.textContent = 'Reconnect'; P.onclick = () => ble.retryNow();
+    S.hidden = false; S.textContent = 'Pick another stump'; S.onclick = () => ble.pick();
+    if(liveGame()){ T.hidden = false; T.textContent = 'Open the board by hand'; T.onclick = () => nav('play'); }
+    break;
+
+  default: /* IDLE */
+    if(!msg.textContent || ble.dev === null)
+      msg.textContent = 'Six balls each. Hit the stump, take the wicket. Turn the stump on — its status light blinks fast until it finds you.';
+    P.hidden = false; P.textContent = 'Connect stump'; P.onclick = () => ble.pick();
+    if(liveGame()){ S.hidden = false; S.textContent = 'Open the board by hand'; S.onclick = () => nav('play'); }
+  }
+}
+['btnPrimary','btnSecondary','btnTertiary'].forEach(id => { $(id).dataset.base = $(id).className; });
+
+/* ══════════════════════════════════════════════════════════════════
+   Play painting
+   ══════════════════════════════════════════════════════════════════ */
+function paint(){
+  if(!game) return;
+  const p = cur();
+
+  $('pos').textContent = game.sudden
+    ? `Sudden death · bowler ${game.p+1} of ${game.players.length}`
+    : `Bowler ${game.p+1} of ${game.players.length}`;
+  $('bowler').textContent = p.name;
+  $('tally').textContent = hits(p);
+
+  const ball = $('ball'), val = $('bval'), v = p.balls[game.b];
+  if(game.phase === 'armed'){
+    ball.dataset.s = 'armed';
+  } else if(v === 'W'){
+    ball.dataset.s = 'hit';  val.textContent = 'W';
+    $('drain').style.strokeDashoffset = 0;
+  } else if(v === '.'){
+    ball.dataset.s = 'miss'; val.textContent = '·';
+    $('drain').style.strokeDashoffset = CIRC;
+  } else {
+    ball.dataset.s = 'ready'; val.textContent = 'Ready';
+    $('drain').style.strokeDashoffset = CIRC;
+  }
+
+  const over = $('over');
+  over.innerHTML = '';
+  p.balls.forEach((bv, i) => {
+    const d = document.createElement('div');
+    d.className = 'b';
+    d.dataset.s = bv === 'W' ? 'hit' : bv === '.' ? 'miss' : (i === game.b ? 'now' : 'pending');
+    d.textContent = bv === 'W' ? 'W' : bv === '.' ? '·' : '';
+    d.title = `Ball ${i+1}`;
+    holdToEdit(d, i);
+    over.appendChild(d);
+  });
+
+  /* The Missed button only exists while a window is open — it has nothing
+     to mean at any other time. */
+  const armed = game.phase === 'armed';
+  $('btnMissed').hidden = !armed;
+  $('hint').hidden = armed;
+
+  const online = ble.state === LINK.CONNECTED;
+  const btn = $('btnBowl');
+  btn.disabled = game.phase !== 'ready' || !online;
+  btn.classList.toggle('live', armed);
+  btn.textContent = armed ? 'Waiting for the ball'
+                  : game.phase === 'settling' ? '—'
+                  : online ? 'Bowl' : 'Stump offline';
+
+  if(game.phase === 'ready'){
+    /* Without a stump the board still works — you just score it yourself.
+       Say so rather than leaving a dead button and no explanation. */
+    $('hint').textContent = online ? 'Hold a ball to change it'
+                                   : 'Hold a ball to score it by hand';
+  }
+
+  const rank = [...game.players].sort((a,b) => hits(b) - hits(a));
+  const top = rank.length ? hits(rank[0]) : 0;
+  $('ticker').innerHTML = rank.map(pl =>
+    `<span class="${hits(pl) === top && top > 0 ? 'lead' : ''}">${esc(pl.name)} <b>${hits(pl)}</b></span>`
+  ).join('');
+
+  paintBanner();
+}
+
+/* Long-press override. No-balls, bad run-ups, a sensor that sulked, or a
+   stump that lost power halfway through — there has to be a way for whoever
+   is holding the phone to just fix it, or the game stalls and everyone goes
+   back to a coin. */
+function holdToEdit(el, i){
+  let t = 0, fired = false;
+  const start = () => {
+    fired = false;
+    t = setTimeout(() => {
+      fired = true;
+      const p = cur(), order = [null, 'W', '.'];
+      p.balls[i] = order[(order.indexOf(p.balls[i]) + 1) % 3];   /* pending -> W -> dot */
+      if(navigator.vibrate) navigator.vibrate(30);
+      save(); paint();
+      $('hint').textContent = `Ball ${i+1} set by hand`;
+    }, 600);
+  };
+  const end = e => { clearTimeout(t); if(fired) e.preventDefault(); };
+  el.addEventListener('pointerdown', start);
+  el.addEventListener('pointerup', end);
+  el.addEventListener('pointerleave', () => clearTimeout(t));
+  el.addEventListener('pointercancel', () => clearTimeout(t));
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   Finish + tie-break
+   ══════════════════════════════════════════════════════════════════ */
+function finish(){
+  const rank = [...game.players].sort((a,b) => {
+    const d = hits(b) - hits(a);
+    if(d) return d;
+    return (avgRt(a) ?? 1e9) - (avgRt(b) ?? 1e9);   /* faster average breaks the tie */
+  });
+  const top = hits(rank[0]);
+  const tied = rank.filter(p => hits(p) === top);
+
+  if(tied.length > 1 && !game.sudden){
+    /* A bowl-out that ends level goes to a bowl-off. Same rule here. */
+    game = newGame(tied.map(p => p.name));
+    game.sudden = true;
+    save();
+    $('hint').textContent = '';
+    paint();
+    return;
+  }
+
+  game.phase = 'done';
+  save();
+
+  $('rhead').textContent = game.sudden ? 'Sudden death · winner' : 'Final';
+  $('rwin').textContent  = rank[0].name;
+  $('podium').innerHTML = rank.map((p, i) => `
+    <div class="res ${i === 0 ? 'win' : ''}">
+      <span class="pos">${i+1}</span>
+      <span class="nm">${esc(p.name)}</span>
+      <span class="mini2">${p.balls.map(b => `<i class="${b === 'W' ? 'h' : ''}"></i>`).join('')}</span>
+      <span class="sc">${hits(p)}</span>
+      <span class="rt">${avgRt(p) ? (avgRt(p)/1000).toFixed(1) + 's' : '—'}<br>${bestPeak(p) ? (bestPeak(p)/1000).toFixed(1) + 'g' : ''}</span>
+    </div>`).join('');
+  /* Replace, not push: back from the result should not walk into the
+     finished game. */
+  nav('results', true);
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   Roster
+   ══════════════════════════════════════════════════════════════════ */
+let names = [];
+
+function paintRoster(){
+  $('rlist').innerHTML = names.map((n, i) => `
+    <div class="row">
+      <span class="n">${i+1}</span>
+      <span class="nm">${esc(n)}</span>
+      <button class="x" data-i="${i}" aria-label="Remove ${esc(n)}">×</button>
+    </div>`).join('');
+  $('rlist').querySelectorAll('.x').forEach(b =>
+    b.onclick = () => { names.splice(+b.dataset.i, 1); paintRoster(); });
+  $('btnStart').disabled = names.length === 0;
+  $('btnStart').textContent = names.length < 2 ? 'Start solo' : `Start · ${names.length} bowlers`;
+}
+
+function addName(){
+  const v = $('nameIn').value.trim();
+  if(!v) return;
+  names.push(v);
+  $('nameIn').value = '';
+  $('nameIn').focus();
+  paintRoster();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   Wake lock — the screen must not sleep between balls
+   ══════════════════════════════════════════════════════════════════ */
+let wake = null;
+async function keepAwake(){
+  try {
+    wake = await navigator.wakeLock.request('screen');
+    wake.addEventListener('release', () => { wake = null; });
+  } catch {}
+}
+
+document.addEventListener('visibilitychange', () => {
+  if(document.visibilityState !== 'visible') return;
+  if(!wake && ble.state === LINK.CONNECTED) keepAwake();
+  /* Came back to the app after going to fix the power? Try once, quietly,
+     rather than making them find the button. */
+  if(ble.state === LINK.LOST && ble.dev) ble.retryNow();
+});
+
+/* ══════════════════════════════════════════════════════════════════
+   Wiring
+   ══════════════════════════════════════════════════════════════════ */
+$('btnAdd').onclick = addName;
+$('nameIn').addEventListener('keydown', e => { if(e.key === 'Enter') addName(); });
+
+$('btnStart').onclick = () => {
+  game = newGame(names);
+  save();
+  nav('play');
+};
+
+$('btnBowl').onclick = bowl;
+
+$('btnMissed').onclick = () => {
+  if(game.phase !== 'armed') return;
+  resolveBall('.', null, null, true);
+};
+
+$('btnAgain').onclick = startFresh;
+
+/* ══════════════════════════════════════════════════════════════════
+   Boot
+   ══════════════════════════════════════════════════════════════════ */
+(async function(){
+  fs.paint();
+  history.replaceState({ screen:'home', d:0 }, '');
+
+  const saved = load();
+  if(saved && saved.phase !== 'done'){
+    game = saved;
+    /* Whatever window was open when the page died is long gone. */
+    if(game.phase !== 'ready') game.phase = 'ready';
+    names = game.players.map(p => p.name);
+  }
+
+  /* A reload throws away the BluetoothDevice handle. getDevices() gives it
+     back for stumps this origin already has permission for, so the operator
+     doesn't have to walk the picker again. Not in every Chrome build — if
+     it isn't there, we fall through to the normal Connect button. */
+  if(navigator.bluetooth?.getDevices){
+    try {
+      const known = await navigator.bluetooth.getDevices();
+      const d = known.find(x => x.name?.startsWith('Stump')) || known[0];
+      if(d){
+        ble.attach(d);
+        ble.set(LINK.CONNECTING);
+        ble.open().catch(() => ble.retry());
+      }
+    } catch {}
+  }
+
+  render('home');
+})();
+</script>
+</body>
+</html>
