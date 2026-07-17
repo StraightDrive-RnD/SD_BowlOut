@@ -569,6 +569,17 @@ h1{font-family:var(--disp);font-weight:800;font-size:clamp(34px,10vw,52px);line-
       </div>
     </div>
 
+    <div class="setrow col" id="sfxRow">
+      <div class="txt" style="width:100%">
+        <div class="setlabel">Sound effects</div>
+        <div class="sethelp">A tone for every ball, and a fanfare at the finish.</div>
+      </div>
+      <div class="seg" role="group" aria-label="Sound effects" style="width:100%;margin-top:11px">
+        <button id="segSfxOff" aria-pressed="false">Off</button>
+        <button id="segSfxOn" aria-pressed="true">On</button>
+      </div>
+    </div>
+
     <div class="setrow col" id="nameRow">
       <div class="txt" style="width:100%">
         <div class="setlabel">Stump name</div>
@@ -1015,7 +1026,7 @@ const PREFS = 'bowlout.prefs';
 
 let prefs = { balls: BALLS_DEFAULT, mode: 'rotation', players: PLAYERS_DEFAULT,
               tiebreaks: TB_DEFAULT, auto: false, gap: GAP_DEFAULT, beep: true,
-              window: WIN_DEFAULT, ui: null };
+              window: WIN_DEFAULT, sfx: true, ui: null };
 try { Object.assign(prefs, JSON.parse(localStorage.getItem(PREFS) || '{}')); } catch {}
 
 /* First run: fit the screen rather than make someone find a settings page to
@@ -1281,9 +1292,9 @@ function audioInit(){
   try { actx = new (window.AudioContext || window.webkitAudioContext)(); } catch {}
 }
 
-function beepAt(t, freq, dur, vol){
+function toneAt(t, freq, dur, vol, type){
   const o = actx.createOscillator(), g = actx.createGain();
-  o.type = 'square';
+  o.type = type || 'square';
   o.frequency.value = freq;
   /* Ramp the envelope. A square wave switched on at full gain clicks, and
      on a phone speaker the click is louder than the note. */
@@ -1293,7 +1304,11 @@ function beepAt(t, freq, dur, vol){
   g.gain.linearRampToValueAtTime(0, t + dur);
   o.connect(g); g.connect(actx.destination);
   o.start(t); o.stop(t + dur + 0.01);
-  beeps.push({ o, t });
+  return o;
+}
+
+function beepAt(t, freq, dur, vol){
+  beeps.push({ o: toneAt(t, freq, dur, vol, 'square'), t });
 }
 
 function beepCountdown(sec){
@@ -1323,6 +1338,44 @@ function beepStop(){
   const now = actx.currentTime;
   for(const { o, t } of beeps) if(t > now + 0.03){ try { o.stop(); } catch {} }
   beeps = [];
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   Sound effects
+
+   Synthesised, not sampled. The countdown beeps already prove oscillators
+   carry across a ground better than a phone speaker carries a wav, and
+   three sound files would be three more things to cache, version and
+   fail to load.
+
+   Voiced for the situation, not for a living room. A dot is the common
+   case — it must never grate, so it is the quietest thing here and gets
+   out of the way. A wicket has to cut through a celebrating slip cordon,
+   so it climbs. Victory is the only sound allowed to take its time.
+   ══════════════════════════════════════════════════════════════════ */
+const SFX = {
+  /* Down a fourth, soft triangle. Deflating without being a buzzer —
+     this fires more than any other sound in the app. */
+  dot: [[0, 300, 0.07, 0.12, 'triangle'], [0.06, 200, 0.14, 0.12, 'triangle']],
+  /* Rising triad, square, landing on a held top note. Fits inside the
+     1600 ms resolveBall gives a wicket before the next ball. */
+  wicket: [[0, 660, 0.08, 0.20], [0.075, 880, 0.08, 0.20], [0.15, 1320, 0.28, 0.22]],
+  /* A major arpeggio to the octave, last note held. ~0.95 s total. */
+  victory: [[0, 523.25, 0.11, 0.17], [0.13, 659.25, 0.11, 0.17],
+            [0.26, 783.99, 0.11, 0.17], [0.39, 1046.5, 0.55, 0.20]],
+};
+
+/* Deliberately NOT pushed onto `beeps`. beepStop() cancels everything in
+   that array scheduled more than 30 ms out, and it runs from clearAuto() —
+   which nextBall() reaches via scheduleAuto() on every single ball. A sting
+   parked in there would be cancelled by the ball that follows it. */
+function sfx(name){
+  if(!prefs.sfx) return;
+  audioInit();
+  if(!actx) return;
+  if(actx.state === 'suspended') actx.resume();
+  const t0 = actx.currentTime + 0.02;
+  for(const [at, freq, dur, vol, type] of SFX[name]) toneAt(t0 + at, freq, dur, vol, type);
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -1459,6 +1512,7 @@ function resolveBall(val, manual){
   save();
 
   if(val === 'W'){
+    sfx('wicket');
     flashZing();
     /* The magenta strobe, the W on the board and the stump's own flash
        already say everything the operator needs. Peak g and reaction time
@@ -1466,6 +1520,7 @@ function resolveBall(val, manual){
        nowhere else. */
     $('hint').textContent = '';
   } else {
+    sfx('dot');
     if(navigator.vibrate) navigator.vibrate(18);
     $('hint').textContent = '';
   }
@@ -1485,6 +1540,7 @@ function promoteLateHit(){
   p.balls[game.b] = 'W';
   save();
 
+  sfx('wicket');
   flashZing();
   $('hint').textContent = 'Stump flashed — given W';
   paint();
@@ -1636,7 +1692,7 @@ function showResults(){
   /* Replace, not push: back from the result should not walk into the
      finished game. */
   nav('results', true);
-  if(crown) confetti();
+  if(crown){ confetti(); sfx('victory'); }
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -1832,6 +1888,9 @@ function paintSettings(){
   $('segBeepOn').setAttribute('aria-pressed', String(!!prefs.beep));
   $('segBeepOff').setAttribute('aria-pressed', String(!prefs.beep));
 
+  $('segSfxOn').setAttribute('aria-pressed', String(!!prefs.sfx));
+  $('segSfxOff').setAttribute('aria-pressed', String(!prefs.sfx));
+
   $('btnLedTest').disabled = ble.state !== LINK.CONNECTED;
   paintName();
 }
@@ -1936,6 +1995,16 @@ function setBeep(v){
 }
 $('segBeepOn').onclick  = () => setBeep(true);
 $('segBeepOff').onclick = () => setBeep(false);
+
+/* Same courtesy setBeep extends: hear it here, not by starting a game.
+   The wicket is the one worth auditioning — it's the loudest thing
+   the app will ever do. */
+function setSfx(v){
+  prefs.sfx = v; savePrefs(); paintSettings();
+  if(v) sfx('wicket');
+}
+$('segSfxOn').onclick  = () => setSfx(true);
+$('segSfxOff').onclick = () => setSfx(false);
 
 function setAuto(v){ prefs.auto = v; savePrefs(); paintSettings(); if(screenNow === 'play') scheduleAuto(); }
 $('segManual').onclick = () => setAuto(false);
