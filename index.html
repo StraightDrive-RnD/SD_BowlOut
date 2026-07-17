@@ -377,6 +377,31 @@ h1{font-family:var(--disp);font-weight:800;font-size:clamp(34px,10vw,52px);line-
 
 /* Sits under the zing flash and the link banner: a celebration should never
    cover a broken stump. */
+/* ── Home backdrop video ────────────────────────────────────────
+   OUTSIDE .app on purpose — .app is transformed, which would make it the
+   containing block for anything fixed inside it and trap this in the 520px
+   column. Same reason #drop/#zing/#conf live out here.
+
+   z-index 0 with .app lifted to 1: the video is the floor, never a layer
+   over the UI. Opacity stays low enough to read as texture, not footage —
+   if you can describe what's happening in it, it's too strong. */
+#bg{
+  position:fixed;inset:0;z-index:0;pointer-events:none;
+  opacity:0;transition:opacity .6s ease;
+}
+#bg.on{opacity:1}
+#bg video{width:100%;height:100%;object-fit:cover;opacity:.10;display:block}
+/* Scrim: darkest under the text at top-left, clearing toward the corner.
+   Without this the headline sits on whatever the video happens to be doing. */
+#bg::after{
+  content:'';position:absolute;inset:0;
+  background:
+    linear-gradient(180deg, var(--night) 0%, rgba(12,16,23,.72) 45%, rgba(12,16,23,.88) 100%),
+    radial-gradient(120% 90% at 20% 30%, rgba(12,16,23,.55), transparent 70%);
+}
+.app{position:relative;z-index:1}
+@media (prefers-reduced-motion:reduce){ #bg{display:none} }
+
 #conf{position:fixed;inset:0;pointer-events:none;z-index:55;display:none}
 
 /* ── Zing flash: screen and stump strobe together ───────────────── */
@@ -416,6 +441,8 @@ h1{font-family:var(--disp);font-weight:800;font-size:clamp(34px,10vw,52px);line-
 </style>
 </head>
 <body>
+
+<div id="bg" aria-hidden="true"></div>
 
 <button id="drop"></button>
 <div id="zing"></div>
@@ -794,6 +821,7 @@ function render(id){
   /* Home is the hub. Never offer a way "back" out of it — it always has a
      way forward, and the arrow only ever confused the first screen. */
   $('btnBack').hidden = navDepth === 0 || id === 'home';
+  bgVideo(id === 'home');
   if(id === 'home')     paintHome();
   if(id === 'roster')   paintRoster();
   if(id === 'settings') paintSettings();
@@ -1158,6 +1186,49 @@ function onHit(dv){
 
   resolveBall('W');
 }
+
+/* ─── HOME BACKDROP VIDEO ──────────────────────────────────────────
+   Drop assets/home.mp4 next to the icons and it appears behind the home
+   screen. No file, no video — nothing else changes, exactly like the logo.
+   Set BG_VIDEO to '' to switch it off without touching anything else.
+
+   Built on first use, not at load: the home screen must paint instantly
+   even on a bad ground connection. Paused off-home because decoding video
+   nobody can see is pure battery drain, and this app gets used on phones
+   that have been out in the sun all day. */
+const BG_VIDEO = 'assets/home.mp4';
+
+let bgEl = null;
+function bgVideo(on){
+  const box = $('bg');
+  if(!BG_VIDEO || !box) return;
+  if(matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+
+  if(on && !bgEl){
+    bgEl = document.createElement('video');
+    /* muted + playsinline + autoplay is the only combination mobile
+       browsers will start without a tap. All three are required. */
+    bgEl.muted = true; bgEl.defaultMuted = true;
+    bgEl.playsInline = true; bgEl.autoplay = true;
+    bgEl.loop = true; bgEl.preload = 'auto';
+    bgEl.setAttribute('muted',''); bgEl.setAttribute('playsinline','');
+    /* iOS Low Power Mode refuses autoplay outright. Don't fight it —
+       let the scrim stand on its own and drop the element. */
+    bgEl.onerror = () => { box.remove(); bgEl = null; };
+    bgEl.src = BG_VIDEO;
+    box.appendChild(bgEl);
+  }
+  if(!bgEl) return;
+
+  if(on){ box.classList.add('on'); bgEl.play().catch(() => box.classList.remove('on')); }
+  else  { box.classList.remove('on'); bgEl.pause(); }
+}
+
+/* A backgrounded tab keeps decoding otherwise. */
+document.addEventListener('visibilitychange', () => {
+  if(document.hidden) bgEl?.pause();
+  else if(screenNow === 'home') bgVideo(true);
+});
 
 (() => {
   const el = $('logo');
