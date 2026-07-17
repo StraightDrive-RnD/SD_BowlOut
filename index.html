@@ -47,7 +47,13 @@
   --bone:#F2EFE6;
   --mute:#7C8899;
   --dot:#55616F;
+  /* --zing was doing two unrelated jobs: "a wicket fell" and "something is
+     broken". Splitting them is what lets a wicket go green without turning
+     every validation error and dropped-link banner green with it. --zing now
+     means trouble, and nothing else. */
   --zing:#FF2D78;
+  --hit:#22C55E;
+  --miss:#EF4444;
   --brandA:#1AD7FF;
   --brandB:#64FFC3;
   --flood:#FFB020;
@@ -277,10 +283,15 @@ h1{font-family:var(--disp);font-weight:800;font-size:clamp(34px,10vw,52px);line-
 .ball[data-s="next"] .drain{stroke:var(--dot)}
 .ball[data-s="armed"] .face{border-color:var(--flood);animation:breathe 2s ease-in-out infinite}
 .ball[data-s="armed"] .val{color:var(--flood)}
-.ball[data-s="hit"]  .face{background:var(--zing);border-color:var(--zing)}
-.ball[data-s="hit"]  .val{color:#fff;font-size:clamp(56px,20vw,92px)}
-.ball[data-s="miss"] .face{border-color:var(--dot)}
-.ball[data-s="miss"] .val{color:var(--dot);font-size:clamp(56px,20vw,92px)}
+.ball[data-s="hit"]  .face{background:var(--hit);border-color:var(--hit)}
+/* Dark W, not white. Green is the brightest hue on the wheel: white-on-green
+   is 2.28:1, worse than the pink this replaces. Night-on-green is 8.36:1. */
+.ball[data-s="hit"]  .val{color:var(--night);font-size:clamp(56px,20vw,92px)}
+.ball[data-s="miss"] .face{border-color:var(--miss)}
+/* MISSED is a word, not a glyph — it cannot ride the 92px size the W uses. */
+.ball[data-s="miss"] .val{
+  color:var(--miss);font-size:clamp(19px,6.2vw,29px);letter-spacing:.14em;
+}
 /* Mirrors the 2 s triangle the firmware runs on the stump LED. Same
    rhythm on the phone and on the box. */
 @keyframes breathe{
@@ -314,9 +325,12 @@ h1{font-family:var(--disp);font-weight:800;font-size:clamp(34px,10vw,52px);line-
   font-family:var(--disp);font-weight:800;font-size:calc(var(--bsz) * .58);
   line-height:1;color:transparent;cursor:pointer;font-style:normal;
 }
-.prow .pb i[data-s="hit"]{background:var(--zing);border-color:var(--zing);color:#fff}
+.prow .pb i[data-s="hit"]{background:var(--hit);border-color:var(--hit);color:var(--night)}
+/* Red, matching the miss flash and the MISSED gauge. --miss, not the --dot
+   token: --dot is the app's generic grey and also paints scrollbars, help
+   text, hints and the auto countdown ring. */
 .prow .pb i[data-s="miss"]::after{
-  content:'';display:block;border-radius:50%;background:var(--dot);
+  content:'';display:block;border-radius:50%;background:var(--miss);
   width:calc(var(--bsz) * .42);height:calc(var(--bsz) * .42);
 }
 .prow .pb i[data-s="now"]{border-color:var(--flood);box-shadow:inset 0 0 0 2px rgba(255,176,32,.22)}
@@ -372,7 +386,7 @@ h1{font-family:var(--disp);font-weight:800;font-size:clamp(34px,10vw,52px);line-
 .res .nm{font-family:var(--disp);font-size:23px;font-weight:700;text-transform:uppercase;flex:1;min-width:48px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .res .mini2{display:flex;gap:4px;flex:0 0 auto}
 .res .mini2 i{width:11px;height:11px;border-radius:50%;background:var(--line)}
-.res .mini2 i.h{background:var(--zing)}
+.res .mini2 i.h{background:var(--hit)}
 .res .sc{font-family:var(--disp);font-size:24px;font-weight:800;width:28px;text-align:right;flex:0 0 auto}
 
 /* Sits under the zing flash and the link banner: a celebration should never
@@ -380,7 +394,8 @@ h1{font-family:var(--disp);font-weight:800;font-size:clamp(34px,10vw,52px);line-
 #conf{position:fixed;inset:0;pointer-events:none;z-index:55;display:none}
 
 /* ── Zing flash: screen and stump strobe together ───────────────── */
-#zing{position:fixed;inset:0;background:var(--zing);pointer-events:none;opacity:0;z-index:60}
+#zing{position:fixed;inset:0;background:var(--hit);pointer-events:none;opacity:0;z-index:60}
+#zing.miss{background:var(--miss)}
 #zing.go{animation:strobe .42s steps(1,end)}
 @keyframes strobe{
   0%,20%,40%{opacity:.9}
@@ -558,21 +573,10 @@ h1{font-family:var(--disp);font-weight:800;font-size:clamp(34px,10vw,52px);line-
       </div>
     </div>
 
-    <div class="setrow col" id="beepRow" hidden>
-      <div class="txt" style="width:100%">
-        <div class="setlabel">Countdown beep</div>
-        <div class="sethelp">Three pips, then a tone as the window opens.</div>
-      </div>
-      <div class="seg" role="group" aria-label="Countdown beep" style="width:100%;margin-top:11px">
-        <button id="segBeepOff" aria-pressed="false">Off</button>
-        <button id="segBeepOn" aria-pressed="true">On</button>
-      </div>
-    </div>
-
     <div class="setrow col" id="sfxRow">
       <div class="txt" style="width:100%">
         <div class="setlabel">Sound effects</div>
-        <div class="sethelp">A tone for every ball, and a fanfare at the finish.</div>
+        <div class="sethelp">Every ball, the auto countdown, and a fanfare at the finish.</div>
       </div>
       <div class="seg" role="group" aria-label="Sound effects" style="width:100%;margin-top:11px">
         <button id="segSfxOff" aria-pressed="false">Off</button>
@@ -1025,8 +1029,14 @@ const SAVE = 'bowlout.v2';       /* v1 saves have no rounds[]; let them lapse */
 const PREFS = 'bowlout.prefs';
 
 let prefs = { balls: BALLS_DEFAULT, mode: 'rotation', players: PLAYERS_DEFAULT,
-              tiebreaks: TB_DEFAULT, auto: false, gap: GAP_DEFAULT, beep: true,
+              tiebreaks: TB_DEFAULT, auto: false, gap: GAP_DEFAULT,
               window: WIN_DEFAULT, sfx: true, ui: null };
+/* `beep` was a second, separate switch for the auto countdown, and it lived
+   in a row that only appeared in auto mode — so the app had one audio
+   setting you could find and one you couldn't. sfx now governs everything
+   that makes a noise. An old stored `beep` value is simply ignored: nothing
+   reads it any more, and dropping it from a saved prefs blob isn't worth
+   a migration. */
 try { Object.assign(prefs, JSON.parse(localStorage.getItem(PREFS) || '{}')); } catch {}
 
 /* First run: fit the screen rather than make someone find a settings page to
@@ -1312,7 +1322,7 @@ function beepAt(t, freq, dur, vol){
 }
 
 function beepCountdown(sec){
-  if(!prefs.beep) return;
+  if(!prefs.sfx) return;
   audioInit();
   if(!actx) return;
   if(actx.state === 'suspended') actx.resume();
@@ -1487,12 +1497,27 @@ function abortBall(){
   if(screenNow === 'play') paint();
 }
 
-/* Screen strobe, timed to the firmware's 3 x 60 ms MOSFET strobe. */
-function flashZing(){
-  $('zing').classList.remove('go');
-  void $('zing').offsetWidth;
-  $('zing').classList.add('go');
-  if(navigator.vibrate) navigator.vibrate([40,50,40,50,90]);
+/* Screen strobe, timed to the firmware's 3 x 60 ms MOSFET strobe.
+   Green for a wicket, red for a miss.
+
+   The .go class is now cleared on a timer. It never used to be, which was
+   harmless while the animation ran — it ends on opacity 0 either way. But
+   under prefers-reduced-motion the strobe is killed by `animation:none` and
+   `#zing.go{opacity:.9}` is all that's left, so the class stuck meant the
+   whole screen stayed tinted until the NEXT ball flashed. Reduced-motion
+   users had a permanent pink veil over the app after their first wicket. */
+let zingTimer = 0;
+function flash(kind){
+  const z = $('zing');
+  clearTimeout(zingTimer);
+  z.classList.remove('go');
+  z.classList.toggle('miss', kind === 'miss');
+  void z.offsetWidth;
+  z.classList.add('go');
+  zingTimer = setTimeout(() => z.classList.remove('go'), 460);
+  /* A miss gets a single short buzz, not the wicket's five-part rattle.
+     It fires on most balls — it has to stay out of the way. */
+  if(navigator.vibrate) navigator.vibrate(kind === 'miss' ? 18 : [40,50,40,50,90]);
 }
 
 function resolveBall(val, manual){
@@ -1513,7 +1538,7 @@ function resolveBall(val, manual){
 
   if(val === 'W'){
     sfx('wicket');
-    flashZing();
+    flash('hit');
     /* The magenta strobe, the W on the board and the stump's own flash
        already say everything the operator needs. Peak g and reaction time
        go to the console, where they're useful for threshold tuning and
@@ -1521,7 +1546,9 @@ function resolveBall(val, manual){
     $('hint').textContent = '';
   } else {
     sfx('dot');
-    if(navigator.vibrate) navigator.vibrate(18);
+    /* flash() carries the buzz now — a second navigator.vibrate() here
+       would cut the first one off mid-pulse. */
+    flash('miss');
     $('hint').textContent = '';
   }
 
@@ -1541,7 +1568,7 @@ function promoteLateHit(){
   save();
 
   sfx('wicket');
-  flashZing();
+  flash('hit');
   $('hint').textContent = 'Stump flashed — given W';
   paint();
   settleTimer = setTimeout(nextBall, 1600);
@@ -1881,12 +1908,9 @@ function paintSettings(){
   $('autoHelp').textContent = '';
 
   $('gapRow').hidden  = !prefs.auto;
-  $('beepRow').hidden = !prefs.auto;
   $('gapVal').textContent = prefs.gap;
   $('gapDown').disabled = prefs.gap <= GAP_MIN;
   $('gapUp').disabled   = prefs.gap >= GAP_MAX;
-  $('segBeepOn').setAttribute('aria-pressed', String(!!prefs.beep));
-  $('segBeepOff').setAttribute('aria-pressed', String(!prefs.beep));
 
   $('segSfxOn').setAttribute('aria-pressed', String(!!prefs.sfx));
   $('segSfxOff').setAttribute('aria-pressed', String(!prefs.sfx));
@@ -1985,20 +2009,9 @@ $('plDown').onclick = () => bumpPlayers(-1);
 $('gapUp').onclick   = () => { prefs.gap = clamp(prefs.gap+1, GAP_MIN, GAP_MAX); savePrefs(); paintSettings(); };
 $('gapDown').onclick = () => { prefs.gap = clamp(prefs.gap-1, GAP_MIN, GAP_MAX); savePrefs(); paintSettings(); };
 
-function setBeep(v){
-  prefs.beep = v; savePrefs(); paintSettings();
-  /* Let them hear what they just switched on rather than making them start
-     a game to find out. */
-  if(v){ audioInit(); if(actx){ if(actx.state === 'suspended') actx.resume();
-         beepAt(actx.currentTime, 880, 0.09, 0.18);
-         beepAt(actx.currentTime + 0.18, 1320, 0.5, 0.22); } }
-}
-$('segBeepOn').onclick  = () => setBeep(true);
-$('segBeepOff').onclick = () => setBeep(false);
-
-/* Same courtesy setBeep extends: hear it here, not by starting a game.
-   The wicket is the one worth auditioning — it's the loudest thing
-   the app will ever do. */
+/* One switch for everything audible. Let them hear what they just turned on
+   rather than making them start a game to find out — the wicket is the one
+   worth auditioning, being the loudest thing the app will ever do. */
 function setSfx(v){
   prefs.sfx = v; savePrefs(); paintSettings();
   if(v) sfx('wicket');
@@ -2037,7 +2050,7 @@ function paint(){
   } else if(v === 'W'){
     ball.dataset.s = 'hit';  val.textContent = 'W'; $('drain').style.strokeDashoffset = 0;
   } else if(v === '.'){
-    ball.dataset.s = 'miss'; val.textContent = '·'; $('drain').style.strokeDashoffset = CIRC;
+    ball.dataset.s = 'miss'; val.textContent = 'MISSED'; $('drain').style.strokeDashoffset = CIRC;
   } else {
     ball.dataset.s = 'ready'; val.textContent = 'Ready'; $('drain').style.strokeDashoffset = CIRC;
   }
