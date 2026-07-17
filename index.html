@@ -523,6 +523,18 @@ h1{font-family:var(--disp);font-weight:800;font-size:clamp(34px,10vw,52px);line-
       </div>
     </div>
 
+    <div class="setrow">
+      <div class="txt">
+        <div class="setlabel">Scoring window</div>
+        <div class="sethelp" id="winHelp"></div>
+      </div>
+      <div class="stepper">
+        <button id="winDown" aria-label="Shorter scoring window">−</button>
+        <span class="v" id="winVal">20</span>
+        <button id="winUp" aria-label="Longer scoring window">+</button>
+      </div>
+    </div>
+
     <div class="setrow col">
       <div class="txt" style="width:100%">
         <div class="setlabel">Starting each ball</div>
@@ -661,7 +673,20 @@ const UUID = {
 const NAME_PREFIX = 'SD-STUMP_';
 const NAME_SUFFIX_MAX = 24 - NAME_PREFIX.length;
 const CMD = { ARM:1, DISARM:2, THRESH:3, LEDTEST:4, CELEBRATE:5, STATUS:6 };
-const WINDOW_MS = 20000;
+/* The scoring window: how long the stump stays live for one ball.
+
+   It travels to the firmware as a uint16 of MILLISECONDS (see arm()), so
+   65535 is the longest window the protocol can express — 60 s fits with
+   room to spare. Seconds here, milliseconds on the wire.
+
+   0 means "no limit": the app stops counting and the ball stays live until
+   the stump is hit. The box still gets the longest failsafe the protocol
+   allows, because a stump left armed forever is a stump that burns its
+   battery in a kit bag. */
+const WIN_MIN = 0, WIN_MAX = 60, WIN_DEFAULT = 20;
+const WIN_PROTO_MAX_MS = 65535;
+const winSec = () => prefs.window ?? WIN_DEFAULT;
+const winMs  = () => (winSec() > 0 ? winSec() * 1000 : WIN_PROTO_MAX_MS);
 
 const BALLS_MIN = 1, BALLS_MAX = 10, BALLS_DEFAULT = 6;
 const PLAYERS_MIN = 1, PLAYERS_MAX = 6, PLAYERS_DEFAULT = 6;
@@ -670,8 +695,14 @@ const PLAYERS_MIN = 1, PLAYERS_MAX = 6, PLAYERS_DEFAULT = 6;
    they re-bowl, two still tie, they go again. But three bowlers who all
    score zero would chain forever, so it is capped. Past the cap the
    earliest wicket settles it; if that can't separate them either, it is
-   an honest tie and the board says so. */
-const TB_MIN = 1, TB_MAX = 3, TB_DEFAULT = 1;
+   an honest tie and the board says so.
+
+   0 turns bowl-offs off entirely. Nothing special is needed to make that
+   work — endRound already compares `tbUsed < game.tiebreaks`, which is
+   false from the very first tie when the cap is 0, so a level score falls
+   straight through to the earliest-wicket rule and then to an honest tie.
+   The same two fallbacks that catch a spent cap catch an absent one. */
+const TB_MIN = 0, TB_MAX = 3, TB_DEFAULT = 1;
 
 /* Auto mode's hand-over gap, in seconds. The gauge counts it down and
    "Bowl now" skips it, so this is a floor, not a wait. */
@@ -920,7 +951,7 @@ const ble = {
     } catch(err){ console.warn('rename failed', err); return false; }
   },
 
-  arm(ballId){ return this.send([CMD.ARM, ballId & 0xFF, WINDOW_MS & 0xFF, WINDOW_MS >> 8]); },
+  arm(ballId, ms){ return this.send([CMD.ARM, ballId & 0xFF, ms & 0xFF, ms >> 8]); },
   disarm(){ return this.send([CMD.DISARM]); },
   ledTest(sec){ return this.send([CMD.LEDTEST, sec]); },
 
@@ -984,7 +1015,7 @@ const PREFS = 'bowlout.prefs';
 
 let prefs = { balls: BALLS_DEFAULT, mode: 'rotation', players: PLAYERS_DEFAULT,
               tiebreaks: TB_DEFAULT, auto: false, gap: GAP_DEFAULT, beep: true,
-              ui: null };
+              window: WIN_DEFAULT, ui: null };
 try { Object.assign(prefs, JSON.parse(localStorage.getItem(PREFS) || '{}')); } catch {}
 
 /* First run: fit the screen rather than make someone find a settings page to
@@ -1107,7 +1138,7 @@ function onStatus(dv){
      and we'd ping-pong over the air for the whole 500 ms. */
   if(devState === DEV.IDLE && game?.phase === 'armed' && armedBallId !== null){
     console.warn('stump idle while a window is open — re-arming ball', armedBallId);
-    ble.arm(armedBallId);
+    ble.arm(armedBallId, armWin);
   }
 }
 
@@ -1367,9 +1398,15 @@ async function bowl(){
   armedBallId = game.seq & 0xFF;
   manualMissBall = null;
 
+  /* Snapshot for the ball we're about to arm. Reading the pref again later
+     would let a settings change mid-ball rescale a ring that's already
+     draining, or resolve a miss against a window the stump never got. */
+  armWin = winMs();
+  armFree = winSec() === 0;
+
   arming = true;
   let ok;
-  try { ok = await ble.arm(armedBallId); }
+  try { ok = await ble.arm(armedBallId, armWin); }
   finally { arming = false; }
   if(!ok){ $('hint').textContent = 'Could not reach the stump'; return; }
 
@@ -1382,7 +1419,7 @@ async function bowl(){
   clearTimeout(windowTimer);
   windowTimer = setTimeout(() => {
     if(game.phase === 'armed') resolveBall('.');
-  }, WINDOW_MS + 400);
+  }, armWin + 400);
 
   paint();
   tick();
@@ -1523,11 +1560,33 @@ function showResults(){
   const champs = last.filter(x => x.pos === 1);
   const decided = champs.length === 1;
 
+  /* One bowler entered, so there was nobody to beat. Crowning the winner of
+     a field of one is hollow at best, and when they've missed every ball it
+     reads as a trophy for scoring nothing. There is no result to report —
+     only a round. So report the round: what they hit, out of what they
+     bowled, and no podium highlight or confetti to imply otherwise.
+     Measured off rounds[0], which is who actually entered the game. */
+  const solo = game.rounds[0].players.length === 1;
+
   let head = 'Winner', flat = false;
   let sub = game.rounds.length > 1 ? `After ${game.rounds.length} rounds` : '';
   let winner = last[0].p.name;
+  let crown = decided;
 
-  if(levelOnHits.length > 1){
+  if(solo){
+    const p = last[0].p;
+    const n = hits(p), of = p.balls.length;
+    const ball = c => `${c} ${c === 1 ? 'ball' : 'balls'}`;
+    head = 'Solo round'; flat = true; crown = false;
+    winner = `${n} of ${of}`;
+    const on = hitIdx(p).map(i => i + 1).join(', ');
+    sub = n === 0   ? `${p.name} · no wickets from ${ball(of)}`
+        : n === of  ? `${p.name} · every ball`
+        : `${p.name} · ${n === 1 ? 'wicket on ball' : 'wickets on balls'} ${on}`;
+    /* A clean sweep is still worth something, even unopposed. Nothing else
+       gets the confetti — least of all a duck. */
+    if(n > 0 && n === of) crown = true;
+  } else if(levelOnHits.length > 1){
     if(decided){
       /* Level on wickets, split by who got there first. Say so — nobody
          should have to reverse-engineer the result off the dots. */
@@ -1555,14 +1614,14 @@ function showResults(){
     const nextIds = game.rounds[r+1] ? new Set(game.rounds[r+1].players.map(pkey)) : null;
     const isLast = r === game.rounds.length - 1;
 
-    html += `<div class="rhead ${R.tb ? 'tb' : ''}">Round ${r+1}${R.tb ? ' · Tie-break' : ''} · ${R.players.length} bowlers</div>`;
+    html += `<div class="rhead ${R.tb ? 'tb' : ''}">Round ${r+1}${R.tb ? ' · Tie-break' : ''} · ${R.players.length} ${R.players.length === 1 ? 'bowler' : 'bowlers'}</div>`;
     /* Only the last round gets positions split by earliest wicket — the
        earlier ones ended level, which is precisely why there was another. */
     html += rankOf(R.players, isLast).map(({p, pos}) => {
       /* Knocked out here. The old build dropped these players entirely —
          that was the bug. They stay, dimmed. */
       const gone = nextIds && !nextIds.has(pkey(p));
-      const win  = isLast && pos === 1 && decided;
+      const win  = isLast && pos === 1 && decided && !solo;
       return `
       <div class="res ${win ? 'win' : ''} ${gone ? 'gone' : ''}">
         <span class="pos">${pos}</span>
@@ -1577,7 +1636,7 @@ function showResults(){
   /* Replace, not push: back from the result should not walk into the
      finished game. */
   nav('results', true);
-  if(decided) confetti();
+  if(crown) confetti();
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -1585,10 +1644,22 @@ function showResults(){
    ══════════════════════════════════════════════════════════════════ */
 const CIRC = 2 * Math.PI * 46;
 
+/* The window this ball was armed with, and whether it was a no-limit one.
+   Snapshotted at arm time — see bowl(). */
+let armWin = WIN_DEFAULT * 1000, armFree = false;
+
 function tick(){
   if(!game || game.phase !== 'armed') return;
-  const left = Math.max(0, WINDOW_MS - (performance.now() - armedAt));
-  $('drain').style.strokeDashoffset = CIRC * (1 - left / WINDOW_MS);
+  /* No limit: nothing is draining. Paint the ring full once and stop —
+     a rAF loop redrawing an identical frame for a minute is pure battery,
+     and dividing by a zero window would hand the ring a NaN offset. */
+  if(armFree){
+    $('drain').style.strokeDashoffset = 0;
+    $('bval').textContent = '\u221E';
+    return;
+  }
+  const left = Math.max(0, armWin - (performance.now() - armedAt));
+  $('drain').style.strokeDashoffset = CIRC * (1 - left / armWin);
   $('bval').textContent = Math.ceil(left / 1000);
   rafId = requestAnimationFrame(tick);
 }
@@ -1728,12 +1799,26 @@ function paintSettings(){
   $('plUp').disabled   = prefs.players >= PLAYERS_MAX;
   $('playersHelp').textContent = '';
 
-  $('tbVal').textContent = prefs.tiebreaks;
+  /* 'Off' rather than '0': a bare zero in a stepper reads as a broken
+     value, not a deliberate choice. */
+  $('tbVal').textContent = prefs.tiebreaks === 0 ? 'Off' : prefs.tiebreaks;
+  $('tbVal').style.fontSize = prefs.tiebreaks === 0 ? '16px' : '';
   $('tbDown').disabled = prefs.tiebreaks <= TB_MIN;
   $('tbUp').disabled   = prefs.tiebreaks >= TB_MAX;
   $('tbHelp').textContent = live
     ? 'Applies to the next game.'
-    : 'Bowl-offs before the earliest wicket decides.';
+    : prefs.tiebreaks === 0
+      ? 'No bowl-offs. A level score is settled by the earliest wicket, or stands as a tie.'
+      : 'Bowl-offs before the earliest wicket decides.';
+
+  /* The window is read fresh at each arm, so unlike balls and tie-breaks
+     it genuinely does apply mid-game — from the next ball, not this one. */
+  $('winVal').textContent = winSec() === 0 ? '\u221E' : winSec();
+  $('winDown').disabled = winSec() <= WIN_MIN;
+  $('winUp').disabled   = winSec() >= WIN_MAX;
+  $('winHelp').textContent = winSec() === 0
+    ? 'No limit — the ball stays live until the stump is hit.'
+    : `Seconds the stump stays live for each ball.${live ? ' Applies from the next ball.' : ''}`;
 
   $('segManual').setAttribute('aria-pressed', String(!prefs.auto));
   $('segAuto').setAttribute('aria-pressed', String(!!prefs.auto));
@@ -1822,6 +1907,8 @@ $('uiDown').onclick = () => bumpUI(-1);
 $('ballsUp').onclick   = () => { prefs.balls = clamp(prefs.balls+1, BALLS_MIN, BALLS_MAX); savePrefs(); paintSettings(); };
 $('ballsDown').onclick = () => { prefs.balls = clamp(prefs.balls-1, BALLS_MIN, BALLS_MAX); savePrefs(); paintSettings(); };
 
+$('winUp').onclick   = () => { prefs.window = clamp(winSec()+1, WIN_MIN, WIN_MAX); savePrefs(); paintSettings(); };
+$('winDown').onclick = () => { prefs.window = clamp(winSec()-1, WIN_MIN, WIN_MAX); savePrefs(); paintSettings(); };
 $('tbUp').onclick   = () => { prefs.tiebreaks = clamp(prefs.tiebreaks+1, TB_MIN, TB_MAX); savePrefs(); paintSettings(); };
 $('tbDown').onclick = () => { prefs.tiebreaks = clamp(prefs.tiebreaks-1, TB_MIN, TB_MAX); savePrefs(); paintSettings(); };
 
