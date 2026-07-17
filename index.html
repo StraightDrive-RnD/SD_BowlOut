@@ -8,6 +8,8 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <title>Bowl-Out</title>
+<link rel="icon" href="assets/favicon-32.png" sizes="32x32">
+<link rel="apple-touch-icon" href="assets/apple-touch-icon.png">
 
 <!-- Two layers of fullscreen, because one isn't enough on Android:
      1. Fullscreen API below — works in a tab, needs a user gesture.
@@ -171,7 +173,7 @@ h1{font-family:var(--disp);font-weight:800;font-size:clamp(34px,10vw,52px);line-
 
 /* ── Home ───────────────────────────────────────────────────────── */
 #home{justify-content:center;gap:16px;overflow-y:auto}
-#logo{max-height:64px;max-width:70%;object-fit:contain;object-position:left center;margin-bottom:-4px}
+#logo{max-height:104px;max-width:78%;object-fit:contain;object-position:left center;margin-bottom:2px}
 
 /* ── Roster ─────────────────────────────────────────────────────── */
 #roster,#tiebreak{padding-top:22px;gap:14px}
@@ -660,14 +662,14 @@ const uiFit = () => Math.min(UI_MAX, Math.max(1, Math.round(innerWidth / UI_DESI
 const $ = id => document.getElementById(id);
 
 /* ─── YOUR LOGO ────────────────────────────────────────────────────
-   Drop a file called logo.png (or .svg) next to this HTML and it appears
+   The file lives at assets/logo.png (or .svg) and it appears
    on the home screen. To keep everything in one file instead, paste a data
    URI here:  const LOGO_SRC = 'data:image/svg+xml;base64,PHN2Zy...';
    If the file isn't there the logo simply doesn't render — no broken-image
    icon, nothing else changes.
    Set BRAND_LINE to '' if your logo already says the name. */
-const LOGO_SRC   = 'logo.png';
-const BRAND_LINE = 'Digital stump';
+const LOGO_SRC   = 'assets/logo.png';
+const BRAND_LINE = '';
 /* ────────────────────────────────────────────────────────────────── */
 const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 
