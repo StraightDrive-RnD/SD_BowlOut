@@ -377,31 +377,6 @@ h1{font-family:var(--disp);font-weight:800;font-size:clamp(34px,10vw,52px);line-
 
 /* Sits under the zing flash and the link banner: a celebration should never
    cover a broken stump. */
-/* ── Intro splash ───────────────────────────────────────────────
-   Outside .app, like #drop/#zing/#conf — .app is transformed and would
-   become the containing block for anything fixed inside it.
-   z-index 90: above #drop (70), because nothing should sit over this. */
-#splash{
-  position:fixed;inset:0;z-index:90;background:var(--night);
-  display:none;opacity:1;transition:opacity .45s ease;
-}
-#splash.go{display:block}
-#splash.out{opacity:0;pointer-events:none}
-#splash video{width:100%;height:100%;object-fit:cover;display:block}
-.schip{
-  position:absolute;bottom:calc(max(env(safe-area-inset-bottom),10px) + 14px);
-  display:flex;align-items:center;gap:7px;
-  font-family:var(--data);font-size:12px;font-weight:700;
-  letter-spacing:.1em;text-transform:uppercase;
-  background:rgba(12,16,23,.62);color:var(--bone);
-  border:1px solid rgba(242,239,230,.22);border-radius:999px;
-  padding:9px 15px;cursor:pointer;backdrop-filter:blur(6px);
-  -webkit-tap-highlight-color:transparent;
-}
-#sSkip{right:18px}
-#sSound{left:18px;display:none}
-#sSound.on{display:flex}
-
 #conf{position:fixed;inset:0;pointer-events:none;z-index:55;display:none}
 
 /* ── Zing flash: screen and stump strobe together ───────────────── */
@@ -441,11 +416,6 @@ h1{font-family:var(--disp);font-weight:800;font-size:clamp(34px,10vw,52px);line-
 </style>
 </head>
 <body>
-
-<div id="splash" aria-hidden="true">
-  <button class="schip" id="sSound">&#9834; Sound</button>
-  <button class="schip" id="sSkip">Skip &#9654;</button>
-</div>
 
 <button id="drop"></button>
 <div id="zing"></div>
@@ -1187,79 +1157,6 @@ function onHit(dv){
   if(game?.phase !== 'armed' || h.ballId !== armedBallId) return;
 
   resolveBall('W');
-}
-
-/* ─── INTRO SPLASH ─────────────────────────────────────────────────
-   assets/home.mp4 plays once, full screen, the very first time someone
-   opens the app on this device. Then never again.
-
-   Once, not every load. This is a utility people open pitch-side between
-   deliveries — a 10s film on every visit would be infuriating by the third
-   over. SEEN is the whole difference between a brand moment and an
-   obstacle. Clear it from the console to see the intro again:
-       localStorage.removeItem('bowlout.seen')
-
-   On sound: browsers block unmuted autoplay without a user gesture, and a
-   first-time visitor is exactly the case with no gesture and no engagement
-   history. So we ASK for sound, and when we're refused we fall back to a
-   muted playback with a Sound chip — one tap, and the audio joins in place
-   without restarting. Never gamble the whole intro on the audio: a rejected
-   play() with no fallback is a black screen where the app should be. */
-const INTRO = 'assets/home.mp4';
-const SEEN  = 'bowlout.seen';
-
-function intro(){
-  return new Promise(done => {
-    let seen = true;
-    try { seen = !!localStorage.getItem(SEEN); } catch {}
-    const box = $('splash');
-    const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
-    if(seen || reduced || !INTRO || !box){ box?.remove(); return done(); }
-    try { localStorage.setItem(SEEN, '1'); } catch {}
-
-    const v = document.createElement('video');
-    v.playsInline = true; v.autoplay = true; v.preload = 'auto';
-    v.setAttribute('playsinline',''); v.setAttribute('autoplay','');
-    box.prepend(v);
-
-    let gone = false;
-    const bail = () => {
-      if(gone) return; gone = true;
-      clearTimeout(guard);
-      box.classList.add('out');
-      /* Free the decoder — don't leave it running behind the app. */
-      setTimeout(() => { v.pause(); v.removeAttribute('src'); v.load(); box.remove(); }, 500);
-      done();
-    };
-
-    /* Nothing may outlive this. A stalled network, a codec the device won't
-       take, an autoplay policy we didn't predict — the app still opens. */
-    const guard = setTimeout(bail, 14000);
-    v.onended = bail;
-    v.onerror = bail;
-    v.onstalled = bail;
-    $('sSkip').onclick = bail;
-
-    $('sSound').onclick = () => {
-      v.muted = false;
-      v.volume = 1;
-      v.play().catch(() => {});
-      $('sSound').classList.remove('on');
-    };
-
-    v.src = INTRO;
-    /* Ask for sound first. If refused, retry muted — that always passes —
-       and offer the chip instead of dying. */
-    v.muted = false;
-    v.play().then(() => { box.classList.add('go'); }).catch(() => {
-      v.muted = true;
-      v.setAttribute('muted','');
-      v.play().then(() => {
-        box.classList.add('go');
-        $('sSound').classList.add('on');
-      }).catch(bail);
-    });
-  });
 }
 
 (() => {
@@ -2187,7 +2084,6 @@ $('btnAgain').onclick = () => {
    Boot
    ══════════════════════════════════════════════════════════════════ */
 (async function(){
-  await intro();
   applyUI();
   fs.paint();
   history.replaceState({ screen:'home', d:0 }, '');
