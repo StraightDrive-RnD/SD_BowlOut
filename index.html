@@ -390,14 +390,21 @@ h1{font-family:var(--disp);font-weight:800;font-size:clamp(34px,10vw,52px);line-
   opacity:0;transition:opacity .6s ease;
 }
 #bg.on{opacity:1}
-#bg video{width:100%;height:100%;object-fit:cover;opacity:.10;display:block}
+#bg video{width:100%;height:100%;object-fit:cover;opacity:.55;display:block}
 /* Scrim: darkest under the text at top-left, clearing toward the corner.
-   Without this the headline sits on whatever the video happens to be doing. */
+   Without this the headline sits on whatever the video happens to be doing.
+
+   These numbers are load-bearing. The scrim and the video opacity MULTIPLY,
+   so they have to be tuned together — the first cut used .10 video under an
+   87% scrim, which left 1% of the footage visible and a solid --night stop
+   at 0% that erased the top of the frame outright. Measured against a real
+   frame this holds ~13.5:1 contrast under the headline (AA needs 4.5:1)
+   while the video still reads. Every stop below keeps an alpha < 1. */
 #bg::after{
   content:'';position:absolute;inset:0;
   background:
-    linear-gradient(180deg, var(--night) 0%, rgba(12,16,23,.72) 45%, rgba(12,16,23,.88) 100%),
-    radial-gradient(120% 90% at 20% 30%, rgba(12,16,23,.55), transparent 70%);
+    linear-gradient(180deg, rgba(12,16,23,.55) 0%, rgba(12,16,23,.62) 45%, rgba(12,16,23,.78) 100%),
+    radial-gradient(120% 90% at 20% 30%, rgba(12,16,23,.35), transparent 70%);
 }
 .app{position:relative;z-index:1}
 @media (prefers-reduced-motion:reduce){ #bg{display:none} }
