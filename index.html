@@ -758,6 +758,7 @@ const UUID = {
   stat: 'a7b10004-8c2f-4d3a-9e6b-1f2a3b4c5d6e',
   name: 'a7b10005-8c2f-4d3a-9e6b-1f2a3b4c5d6e',
   ota:  'a7b10006-8c2f-4d3a-9e6b-1f2a3b4c5d6e',
+  ver:  'a7b10007-8c2f-4d3a-9e6b-1f2a3b4c5d6e',
 };
 
 /* The firmware owns the ceiling (24). The prefix is fixed so a scanner list
@@ -923,7 +924,7 @@ function render(id){
   if(id === 'roster')   paintRoster();
   if(id === 'settings') paintSettings();
   if(id === 'about')    paintAbout();
-  if(id === 'ota')      paintOta();
+  if(id === 'ota'){ otaResetView(); paintOta(); }
   if(id === 'play'){ paint(); scheduleAuto(); }
   else clearAuto();
   paintLink();
@@ -1016,6 +1017,15 @@ const ble = {
       this.devName = new TextDecoder().decode(await this.nameChr.readValue()).trim();
     } catch { this.nameChr = null; this.devName = null; }
 
+    /* Firmware version string, from esp_app_get_description() over char 0007.
+       This is the authoritative version; the STATUS byte is only a coarse
+       compat marker. Older firmware lacks this char -> leave version unknown. */
+    try {
+      const vc = await s.getCharacteristic(UUID.ver);
+      fwVersion = new TextDecoder().decode(await vc.readValue()).trim();
+    } catch { fwVersion = null; }
+    if(screenNow === 'about') paintAbout();
+
     /* OTA characteristic: notify carries acks + progress, write carries frames.
        Absent on pre-OTA firmware — the About screen hides Update if so. */
     try {
@@ -1104,6 +1114,7 @@ const ble = {
     try { this.dev?.gatt?.disconnect(); } catch {}
     this.dev = null; this.ctrl = null; this.lastSeq = null;
     this.nameChr = null; this.devName = null; this.otaChr = null;
+    fwVersion = null;
     this.set(LINK.IDLE);
   },
 };
@@ -1236,7 +1247,6 @@ function onStatus(dv){
   /* Byte 9 (older firmware won't send it): is the aux net breakout answering?
      0 also means no net board fitted, which we present identically. */
   netAlive = dv.byteLength > 9 ? dv.getUint8(9) === 1 : null;
-  fwVersion = dv.byteLength > 5 ? dv.getUint8(5) : null;
   if(screenNow === 'settings') paintNet();
   if(screenNow === 'about') paintAbout();
   const peak = dv.getUint16(6, true);
@@ -2452,7 +2462,7 @@ $('btnAgain').onclick = () => {
 const PRODUCTS_URL = 'https://straightdrivesport.com/entertainment/products';
 
 function paintAbout(){
-  $('abFw').textContent   = fwVersion != null ? ('v' + fwVersion) : '—';
+  $('abFw').textContent   = fwVersion ? ('V' + fwVersion).toUpperCase() : '—';
   $('abName').textContent = ble.devName || ble.dev?.name || '—';
   /* Update is offered only when connected to OTA-capable firmware. */
   $('btnOta').hidden = !(ble.state === LINK.CONNECTED && ble.otaChr);
@@ -4783,9 +4793,21 @@ const OTA_SOF=0x23, OTA_EOF=0x21;
 const OTA_CTRL=0xC0, OTA_DATA=0xC1, OTA_START=0x01, OTA_ABORT=0x02, OTA_END=0x03;
 const OTA_OK=0x80, OTA_FAIL=0x81, OTA_ERR=0x82, OTA_PROG=0x83;
 
-let fwBuf = null, otaBusy = false, otaCancel = false, otaPendingAck = null;
+let fwBuf = null, otaBusy = false, otaCancel = false, otaPendingAck = null, otaDone = false;
 
 const otaCrc=(b,n)=>{ let s=0; for(let i=0;i<n;i++) s+=b[i]; return s&0xFF; };
+
+function otaResetView(){
+  /* Called when the OTA screen is opened and no transfer is running, so a
+     completed or abandoned update never leaves a stale bar or file behind. */
+  if(otaBusy) return;
+  fwBuf = null; otaDone = false; otaCancel = false;
+  setOtaPct(0);
+  $('otaProg').hidden = true;
+  $('otaLede').textContent = ble.state === LINK.CONNECTED && ble.otaChr
+    ? 'Pick a firmware file to install on this stump.'
+    : 'Connect to the stump to update its firmware.';
+}
 
 function paintOta(){
   const ready = ble.state === LINK.CONNECTED && ble.otaChr;
