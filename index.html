@@ -253,6 +253,15 @@ h1{font-family:var(--disp);font-weight:800;font-size:clamp(34px,10vw,52px);line-
 .namefield input.bad{border-color:var(--zing)}
 .namefield .btn{width:auto;padding:12px 18px;flex:0 0 auto}
 
+.dotstat{display:inline-block;width:9px;height:9px;border-radius:50%;
+  background:var(--dot);margin-left:8px;vertical-align:middle}
+.dotstat.ok{background:var(--flood);box-shadow:0 0 7px var(--flood)}
+.dotstat.no{background:var(--zing)}
+.chkbtn{width:auto;padding:13px 22px;min-width:96px}
+.chkbtn:disabled{opacity:.4}
+.dotstat.wait{background:var(--flood);animation:dotpulse 1s ease-in-out infinite}
+@keyframes dotpulse{0%,100%{opacity:.35}50%{opacity:1}}
+
 .stepper .v{
   width:52px;text-align:center;font-family:var(--disp);font-size:30px;font-weight:800;
   color:var(--flood);font-variant-numeric:tabular-nums;
@@ -598,11 +607,20 @@ h1{font-family:var(--disp);font-weight:800;font-size:clamp(34px,10vw,52px);line-
     </div>
 
     <div class="setrow">
-      <div class="txt">
-        <div class="setlabel">Test the stump light</div>
-        <div class="sethelp">Three seconds on. Tells a dead box from a dead link.</div>
-      </div>
-      <button class="btn ghost" id="btnLedTest" style="width:auto;padding:13px 20px">Flash</button>
+      <div class="txt"><div class="setlabel">Stump light</div></div>
+      <button class="btn ghost chkbtn" id="btnLedTest">Flash</button>
+    </div>
+
+    <div class="setrow">
+      <div class="txt"><div class="setlabel">Stump hit <span class="dotstat" id="stumpDot"></span></div>
+        <div class="sethelp" id="stumpHelp"></div></div>
+      <button class="btn ghost chkbtn" id="btnStumpChk">Check</button>
+    </div>
+
+    <div class="setrow" id="netRow">
+      <div class="txt"><div class="setlabel">Net hit <span class="dotstat" id="netDot"></span></div>
+        <div class="sethelp" id="netHelp"></div></div>
+      <button class="btn ghost chkbtn" id="btnNetChk">Check</button>
     </div>
     </div>
   </section>
@@ -835,6 +853,7 @@ let screenNow = 'home';
 let navDepth = 0;
 
 function render(id){
+  if(id !== 'settings') checkStop();
   screenNow = id;
   document.querySelectorAll('.screen').forEach(s => s.classList.toggle('show', s.id === id));
   /* Home is the hub. Never offer a way "back" out of it — it always has a
@@ -885,6 +904,7 @@ const ble = {
   state:LINK.IDLE, attempt:0, timer:0, lastSeq:null,
 
   set(s){ this.state = s; paintLink();
+    if(s !== LINK.CONNECTED) checkStop();
     if(screenNow === 'home') paintHome();
     if(screenNow === 'play') paint();
     if(screenNow === 'settings') paintSettings();
@@ -1138,9 +1158,14 @@ function rankOf(players, separate){
 /* Mirrors stump_state.h */
 const DEV = { IDLE:0, ARMED:1, COOLDOWN:2, ERROR:3 };
 let devState = null;
+let netAlive = null;    /* true / false / null (unknown or old firmware) */
 
 function onStatus(dv){
   devState = dv.getUint8(0);
+  /* Byte 9 (older firmware won't send it): is the aux net breakout answering?
+     0 also means no net board fitted, which we present identically. */
+  netAlive = dv.byteLength > 9 ? dv.getUint8(9) === 1 : null;
+  if(screenNow === 'settings') paintNet();
   const peak = dv.getUint16(6, true);
   if(devState === DEV.ERROR){
     $('homeMsg').textContent = 'The stump reports a sensor fault — its status light is blinking fast and steady. Power-cycle it.';
@@ -1173,6 +1198,7 @@ function onHit(dv){
     sinceArm: dv.getUint16(7, true),
     peakMg:   dv.getUint16(9, true),
     armed:    dv.getUint8(11) & 0x01,
+    net:      (dv.getUint8(11) & 0x04) !== 0,
     rise:     dv.getUint8(12),   /* samples from threshold cross to peak  */
     dur:      dv.getUint8(13),   /* samples above the 2 g event threshold */
     osc:      dv.getUint8(14),   /* re-crossings = ring / rebound         */
@@ -1193,9 +1219,27 @@ function onHit(dv){
               `dur=${h.dur}sa/${(h.dur*2.4).toFixed(0)}ms osc=${h.osc} imp=${h.impulse} ` +
               `n=${h.nSamples} src=${h.wakeSrc.toString(2).padStart(3,'0')} armed=${h.armed}`);
 
+  /* An unarmed hit during a "Check" in settings confirms that sensor works.
+     Route it there before the game logic, which ignores unarmed hits. */
+  if(checkWaiting && !h.armed){
+    if((checkWaiting === 'net' && h.net) || (checkWaiting === 'stump' && !h.net)){
+      checkPass();
+      return;
+    }
+  }
+
   /* Knocks while nobody is bowling: not a wicket, just the box being
      carried around. Kept for calibration, never scored. */
   if(!h.armed) return;
+
+  /* Ball hit the NET, not the stump — that's a miss. The firmware only sends
+     this while armed for the current ball, but guard anyway so a late net
+     packet can't overwrite a ball we've already moved past. */
+  if(h.net){
+    if(game?.phase !== 'armed' || h.ballId !== armedBallId) return;
+    resolveBall('.');
+    return;
+  }
 
   /* Operator called it missed, then the ball landed. The stump flashed —
      agree with the box. */
@@ -1915,8 +1959,8 @@ function paintSettings(){
   $('segSfxOn').setAttribute('aria-pressed', String(!!prefs.sfx));
   $('segSfxOff').setAttribute('aria-pressed', String(!prefs.sfx));
 
-  $('btnLedTest').disabled = ble.state !== LINK.CONNECTED;
   paintName();
+  paintChecks();
 }
 
 /* ── Stump name ─────────────────────────────────────────────────────
@@ -2023,6 +2067,80 @@ function setAuto(v){ prefs.auto = v; savePrefs(); paintSettings(); if(screenNow 
 $('segManual').onclick = () => setAuto(false);
 $('segAuto').onclick   = () => setAuto(true);
 $('btnLedTest').onclick = () => ble.ledTest(3);
+
+/* ── Sensor checks ───────────────────────────────────────────────────
+   "Check" arms a 5 s listen. The operator hits the stump or net; the
+   firmware notifies an unarmed hit, onHit routes it here, and the dot goes
+   amber (pass) or, on timeout, magenta (nothing felt). One check at a time. */
+let checkWaiting = null;      /* 'stump' | 'net' | null */
+let checkTimer = 0;
+
+const CHECK_ROWS = {
+  stump: { dot:'stumpDot', help:'stumpHelp', btn:'btnStumpChk' },
+  net:   { dot:'netDot',   help:'netHelp',   btn:'btnNetChk'   },
+};
+
+function checkStart(which){
+  if(ble.state !== LINK.CONNECTED) return;
+  checkStop();                 /* only one at a time */
+  checkWaiting = which;
+  const r = CHECK_ROWS[which];
+  $(r.dot).className = 'dotstat wait';
+  $(r.help).textContent = which === 'net' ? 'Hit the net now…' : 'Hit the stump now…';
+  $(r.btn).textContent = 'Waiting';
+  checkTimer = setTimeout(() => checkFail(), 5000);
+  paintChecks();
+}
+
+function checkPass(){
+  const which = checkWaiting;
+  clearTimeout(checkTimer); checkWaiting = null;
+  const r = CHECK_ROWS[which];
+  $(r.dot).className = 'dotstat ok';
+  $(r.help).textContent = which === 'net' ? 'Net working.' : 'Stump working.';
+  $(r.btn).textContent = 'Check';
+  if(navigator.vibrate) navigator.vibrate(18);
+  paintChecks();
+}
+
+function checkFail(){
+  const which = checkWaiting;
+  clearTimeout(checkTimer); checkWaiting = null;
+  const r = CHECK_ROWS[which];
+  $(r.dot).className = 'dotstat no';
+  $(r.help).textContent = 'No hit detected.';
+  $(r.btn).textContent = 'Check';
+  paintChecks();
+}
+
+function checkStop(){
+  if(!checkWaiting) return;
+  const r = CHECK_ROWS[checkWaiting];
+  clearTimeout(checkTimer); checkWaiting = null;
+  $(r.btn).textContent = 'Check';
+  $(r.help).textContent = '';
+}
+
+$('btnStumpChk').onclick = () => checkStart('stump');
+$('btnNetChk').onclick   = () => checkStart('net');
+
+/* Enable/disable the check controls. Net check needs the aux detected;
+   the amber/magenta net dot before any check reflects that live status. */
+function paintChecks(){
+  const online = ble.state === LINK.CONNECTED;
+  $('btnLedTest').disabled = !online;
+  $('btnStumpChk').disabled = !online || checkWaiting === 'net';
+  $('btnNetChk').disabled   = !online || netAlive !== true || checkWaiting === 'stump';
+
+  /* Seed the net dot from live detection when idle (not mid-check). */
+  if(checkWaiting !== 'net'){
+    const nd = $('netDot');
+    if(!online || netAlive === null){ nd.className = 'dotstat'; }
+    else if(netAlive){ if(!nd.className.includes('ok') && !nd.className.includes('no')) nd.className = 'dotstat ok'; }
+    else { nd.className = 'dotstat no'; $('netHelp').textContent = 'No net detected.'; }
+  }
+}
+function paintNet(){ paintChecks(); }   /* onStatus still calls this name */
 
 /* ══════════════════════════════════════════════════════════════════
    Play painting
