@@ -4847,9 +4847,11 @@ function paintOta(){
   const connected = ble.state === LINK.CONNECTED && ble.otaChr;
   const canInstall = connected && fwState === 'ready' && !!fwBuf && !otaBusy;
 
-  $('btnOtaStart').hidden  = !(canInstall || (fwState === 'uptodate' && connected && !otaBusy));
+  /* Install only when an update is actually available. When the stump is
+     already on the latest firmware we show just the note — no button. */
+  $('btnOtaStart').hidden  = !canInstall;
   $('btnOtaStart').disabled = !connected || otaBusy || !fwBuf;
-  $('btnOtaStart').textContent = fwState === 'uptodate' ? 'Reinstall' : 'Install update';
+  $('btnOtaStart').textContent = 'Install update';
 
   $('btnOtaRetry').hidden  = otaBusy || fwState !== 'error';
   $('btnOtaCancel').hidden = !otaBusy;
