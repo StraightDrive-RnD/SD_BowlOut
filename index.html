@@ -4879,6 +4879,29 @@ function paintOta(){
 /* Fetch metadata (optional) + the .bin, validate it, and decide whether an
    update is offered. Fully guarded: any failure leaves the stump untouched
    and shows a Retry. */
+/* Read the firmware version string straight out of an ESP32 app image. The
+   esp_app_desc_t descriptor sits at a fixed offset: image header (24) +
+   segment header (8) = 32, where a magic word 0xABCD5432 confirms it, and the
+   version[] field is 16 bytes later at offset 48. This is the SAME string the
+   device reports over BLE, so comparing them tells us reliably whether the
+   hosted image matches what's installed — no version.json required. */
+function fwVersionFromBin(buf){
+  try {
+    if(!buf || buf.length < 96) return null;
+    const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+    const magic = dv.getUint32(32, true);        // esp_app_desc_t.magic_word
+    if(magic !== 0xABCD5432) return null;         // not where we expect -> bail
+    let str = '';
+    for(let i = 48; i < 80; i++){                 // version[32] at offset 48
+      const c = buf[i];
+      if(c === 0) break;
+      str += String.fromCharCode(c);
+    }
+    str = str.trim();
+    return str.length ? str : null;
+  } catch { return null; }
+}
+
 async function otaCheck(){
   if(otaBusy) return;
   if(!(ble.state === LINK.CONNECTED && ble.otaChr)){ fwState = 'idle'; paintOta(); return; }
@@ -4886,8 +4909,8 @@ async function otaCheck(){
   otaDone = false;                    /* clear any prior terminal state */
   fwState = 'checking'; fwBuf = null; setOtaPct(0); $('otaProg').hidden = true; paintOta();
 
-  /* 1) Optional version.json. Absent or malformed is fine — we just can't
-        compare versions, so we offer the update rather than block it. */
+  /* Optional version.json — only for release notes now; the authoritative
+     version comes from the image itself (below). Absent is completely fine. */
   fwRemoteVer = null;
   try {
     const r = await fetch(FW_META, { cache: 'no-store' });
@@ -4895,15 +4918,10 @@ async function otaCheck(){
       const j = await r.json();
       if(j && typeof j.version === 'string') fwRemoteVer = j.version.trim();
     }
-  } catch { /* no metadata — continue */ }
+  } catch { /* no metadata — fine */ }
 
-  /* Already on the latest? Offer a reinstall but mark it up-to-date. We still
-     download the bin so Reinstall is instant and validated. */
-  const upToDate = fwRemoteVer && fwVersion &&
-                   String(fwRemoteVer).toLowerCase() === String(fwVersion).toLowerCase();
-
-  /* 2) The image itself. Download the WHOLE thing before we touch the stump:
-        a network drop must never leave a half-written slot. */
+  /* Download the WHOLE image before we touch the stump: a network drop must
+     never leave a half-written slot. */
   try {
     const r = await fetch(FW_BIN, { cache: 'no-store' });
     if(!r.ok) throw new Error(`server returned ${r.status}`);
@@ -4913,6 +4931,17 @@ async function otaCheck(){
        an empty file, or a wrong artifact before it can reach the flash. */
     if(buf.length < 1024) throw new Error('file too small to be firmware');
     if(buf[0] !== 0xE9)   throw new Error('not a valid ESP firmware image');
+
+    /* Read the version straight from the image, and prefer it over any
+       version.json. This is what makes "you're on the latest" work with no
+       extra files. */
+    const binVer = fwVersionFromBin(buf);
+    if(binVer) fwRemoteVer = binVer;
+
+    /* Up to date when the hosted image's version equals what the device
+       reports. Both come from the same esp_app_desc_t.version field. */
+    const upToDate = fwRemoteVer && fwVersion &&
+                     String(fwRemoteVer).toLowerCase() === String(fwVersion).toLowerCase();
 
     fwBuf = buf;
     fwState = upToDate ? 'uptodate' : 'ready';
