@@ -4943,7 +4943,24 @@ function otaAck(ms){
     otaPendingAck={resolve,reject,timer};
   });
 }
-async function otaWrite(frame){ await ble.otaChr.writeValueWithResponse(frame); }
+/* Rejects as soon as the user cancels, so any await racing against it unblocks
+   immediately instead of waiting for a dead device. Re-armed each flash. */
+let otaCancelWake = null;
+function cancelSignal(){
+  return new Promise((_, reject) => { otaCancelWake = () => reject(Object.assign(new Error('cancelled'), {cancelled:true})); });
+}
+
+/* A BLE write that cannot hang forever. writeValueWithResponse can wedge at the
+   GATT layer on some Android stacks if the device stops responding; without a
+   cap the whole flash freezes with the loop stuck here (never reaching the ack
+   timeout), and Cancel — only polled between chunks — never gets read. Racing
+   against a timer + the cancel signal guarantees this always settles. */
+function otaWrite(frame, ms){
+  ms = ms || 5000;   // never let an undefined ms mean 'time out immediately'
+  const to = new Promise((_, reject) =>
+    setTimeout(() => reject(Object.assign(new Error('write timeout'), {retry:true})), ms));
+  return Promise.race([ ble.otaChr.writeValueWithResponse(frame), to, cancelSignal() ]);
+}
 
 function otaCtrlStart(size){ const f=new Uint8Array(10);
   f[0]=OTA_SOF; f[1]=OTA_CTRL; f[2]=5; f[3]=OTA_START;
@@ -4958,12 +4975,17 @@ function otaDataFrame(seq,part){ const len=part.length; const f=new Uint8Array(6
   f.set(part,6); f[6+len]=otaCrc(f,6+len); f[6+len+1]=OTA_EOF; return f; }
 
 $('btnOtaRetry').onclick  = () => otaCheck();
-$('btnOtaCancel').onclick = () => { otaCancel = true; };
+$('btnOtaCancel').onclick = () => {
+  otaCancel = true;
+  $('btnOtaCancel').disabled = true;      // immediate feedback; re-enabled on next flash
+  if(otaCancelWake) otaCancelWake();      // break any in-flight write/ack wait now
+};
 $('btnOtaStart').onclick  = () => otaFlash();
 
 async function otaFlash(){
   if(!fwBuf || !ble.otaChr || otaBusy) return;
   otaBusy = true; otaCancel = false; otaDone = false; fwState = 'flashing';
+  otaCancelWake = null;
   let payload = 504;                 // starts high; auto-shrinks to the MTU
   const timeout = 3000;
   const total = fwBuf.length;
@@ -4972,53 +4994,68 @@ async function otaFlash(){
 
   try {
     // START (generous first-ack window: CCCD + conn-interval settle)
-    let ackP = otaAck(10000);
-    await otaWrite(otaCtrlStart(total));
+    let ackP = otaAck(15000);   // START triggers a full slot erase (~3-6s, more on slow flash)
+    await otaWrite(otaCtrlStart(total), 16000);
     await ackP;
 
-    let sent=0, seq=0, off=0;
+    let sent=0, seq=0, off=0, stallRetries=0;
+    const WRITE_MS = 4000;      // hard cap on a single BLE write
+    const MAX_STALLS = 6;       // consecutive unproductive tries before we give up
     while(off < total){
-      if(otaCancel){
-        try{ const ab=otaAck(timeout); await otaWrite(otaCtrlAbort()); await ab.catch(()=>{}); }catch(_){}
-        throw new Error('cancelled');
-      }
+      if(otaCancel) throw Object.assign(new Error('cancelled'), {cancelled:true});
+
       const part = fwBuf.subarray(off, Math.min(off+payload, total));
       let acked=false, shrank=false;
-      while(!acked){
-        try{
-          ackP = otaAck(timeout);
-          await otaWrite(otaDataFrame(seq, part));
-          await ackP;
-          acked=true;
-        }catch(e){
-          if(otaCancel) break;
-          if(e.fatal) throw new Error('device error');
-          if(e.retry && payload>64){ payload=Math.max(64,Math.floor(payload/2)); shrank=true; break; }
-          throw e;   // timeout or non-retryable
-        }
+      try{
+        ackP = otaAck(timeout);
+        await otaWrite(otaDataFrame(seq, part), WRITE_MS);   // capped write + cancel-aware
+        await Promise.race([ ackP, cancelSignal() ]);         // ack, or cancel breaks in
+        acked=true;
+      }catch(e){
+        if(e.cancelled || otaCancel) throw Object.assign(new Error('cancelled'), {cancelled:true});
+        if(e.fatal) throw new Error('device error');
+        /* A NAK, an ack timeout, or a write timeout: shrink the chunk and retry.
+           Shrinking often clears a device-side buffer stall (the classic freeze
+           part-way through). Cap total unproductive tries so we never loop
+           forever — fail cleanly instead, which frees the UI and Cancel. */
+        if(payload > 64){ payload = Math.max(64, Math.floor(payload/2)); shrank=true; }
+        if(++stallRetries > MAX_STALLS)
+          throw new Error('the stump stopped responding');
       }
-      if(otaCancel) continue;
-      if(shrank) continue;
+      if(!acked){ if(shrank) continue; else continue; }
+      stallRetries = 0;                    // productive chunk: reset the stall counter
       sent+=part.length; off+=part.length; seq++;
       setOtaPct(sent*100/total);
+      /* Yield ~8 ms between chunks so the BLE stack and the device's notify
+         buffer drain. Cheap insurance against a mid-transfer wedge, and it
+         also lets a queued Cancel be seen. */
+      await new Promise(r => setTimeout(r, 8));
     }
 
     // END (validation can take a moment)
     ackP = otaAck(8000);
-    await otaWrite(otaCtrlEnd());
+    await otaWrite(otaCtrlEnd(), 8000);
     await ackP;
     setOtaPct(100);
     otaDone = true; fwState = 'done';
     $('otaLede').textContent = 'Update complete — the stump is rebooting into the new firmware.';
     $('btnOtaCancel').hidden = true;
   } catch(err){
+    /* Best-effort ABORT so the device leaves OTA state cleanly. Capped and
+       swallowed — we're already tearing down, a failed abort must not hang. */
+    if(otaCancel || err.cancelled){
+      try{ await Promise.race([ ble.otaChr.writeValueWithResponse(otaCtrlAbort()),
+                                new Promise(r=>setTimeout(r,800)) ]); }catch(_){}
+    }
     otaDone = true; fwState = 'failed';
-    $('otaLede').textContent = otaCancel
+    $('otaLede').textContent = (otaCancel || err.cancelled)
       ? 'Update cancelled. The stump kept its current firmware.'
       : `Update failed: ${err.message}. The stump kept its current firmware.`;
     setOtaPct(0);
   } finally {
     otaBusy = false;
+    otaCancelWake = null;
+    $('btnOtaCancel').disabled = false;
     /* Terminal states own their own message + bar; only refresh the buttons.
        A fresh re-entry to the screen calls otaResetView -> otaCheck. */
     $('btnOtaStart').hidden  = true;
