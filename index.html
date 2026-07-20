@@ -5020,16 +5020,26 @@ async function otaFlash(){
        fails we restart the ENTIRE image (fresh START) at a smaller payload.
        In practice the first run at full size succeeds; the restart path is a
        safety net for a flaky link. */
-    const WRITE_MS = 5000;
-    const WINDOW = 16;                       // frames in flight (< device queue 24)
-    const PAYLOADS = [512, 256, 128, 64];    // tried in order across restarts
+    const WRITE_MS = 6000;
+    /* Each restart tries a smaller payload AND a smaller window. The real
+       pressure on the device is the number of un-acked frames in flight (TX
+       notify load), so shrinking the window matters as much as the chunk. The
+       first setting is already conservative enough to complete on a healthy
+       link; the rest are safety nets. */
+    const RUNS = [
+      { payload: 512, window: 8 },
+      { payload: 256, window: 6 },
+      { payload: 128, window: 4 },
+      { payload:  64, window: 2 },
+    ];
     let attempt = 0, done = false;
 
-    for(attempt = 0; attempt < PAYLOADS.length && !done; attempt++){
-      const payload = PAYLOADS[attempt];
+    for(attempt = 0; attempt < RUNS.length && !done; attempt++){
+      const payload = RUNS[attempt].payload;
+      const WINDOW  = RUNS[attempt].window;
       if(otaCancel) throw Object.assign(new Error('cancelled'), {cancelled:true});
       if(attempt > 0){
-        $('otaLede').textContent = `Retrying at a safer speed (${payload} B chunks)…`;
+        $('otaLede').textContent = `Retrying at a safer speed (${payload} B \u00d7 ${WINDOW})…`;
         await new Promise(r => setTimeout(r, 200));
       }
 
@@ -5064,7 +5074,7 @@ async function otaFlash(){
           // Top up the window.
           while(pending.length < WINDOW && off < total){
             const part = fwBuf.subarray(off, Math.min(off + payload, total));
-            const ackP = otaAck(4000);                     // waiter enqueued in order
+            const ackP = otaAck(6000);                     // waiter enqueued in order (device may retry a late notify)
             await otaWrite(otaDataFrame(seq, part), WRITE_MS);
             pending.push(track(ackP));
             off += part.length; seq++;
@@ -5095,7 +5105,7 @@ async function otaFlash(){
         try{ await Promise.race([ ble.otaChr.writeValueWithResponse(otaCtrlAbort()),
                                   new Promise(r=>setTimeout(r,600)) ]); }catch(_){}
         setOtaPct(0);
-        if(attempt >= PAYLOADS.length - 1) throw new Error('the stump stopped responding');
+        if(attempt >= RUNS.length - 1) throw new Error('the stump stopped responding');
         // else loop restarts at the next-smaller payload
       }
     }
