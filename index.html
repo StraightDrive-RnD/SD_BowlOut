@@ -745,17 +745,16 @@ h1{font-family:var(--disp);font-weight:800;font-size:clamp(34px,10vw,52px);line-
   <section class="screen" id="ota">
     <div class="eyebrow">Firmware</div>
     <h1>Update</h1>
-    <p class="lede" id="otaLede">Pick a firmware file to install on this stump.</p>
+    <p class="lede" id="otaLede">Checking for the latest firmware…</p>
 
     <div class="otaprog" id="otaProg" hidden>
       <div class="otabar"><div class="otafill" id="otaFill"></div></div>
       <div class="otapct" id="otaPct">0%</div>
     </div>
 
-    <input type="file" id="otaFile" accept=".bin" hidden>
     <div class="stack">
-      <button class="btn" id="btnOtaPick">Choose file</button>
-      <button class="btn" id="btnOtaStart" hidden>Install</button>
+      <button class="btn" id="btnOtaStart" hidden>Install update</button>
+      <button class="btn ghost" id="btnOtaRetry" hidden>Retry</button>
       <button class="btn ghost" id="btnOtaCancel" hidden>Cancel</button>
     </div>
   </section>
@@ -4812,30 +4811,112 @@ const OTA_OK=0x80, OTA_FAIL=0x81, OTA_ERR=0x82, OTA_PROG=0x83;
 
 let fwBuf = null, otaBusy = false, otaCancel = false, otaPendingAck = null, otaDone = false;
 
+/* Remote firmware config. The .bin lives alongside the app, in a firmware/
+   folder (like assets/), so it resolves relative to wherever index.html is
+   hosted — GitHub Pages, a custom domain, anything — with no hardcoded host.
+   To point elsewhere (e.g. raw.githubusercontent.com), set FW_BASE to an
+   absolute URL ending in a slash. Note: cross-origin hosts must send CORS
+   headers; same-origin (Pages) needs nothing. */
+const FW_BASE = 'firmware/';          // relative: same origin as the app
+const FW_BIN  = FW_BASE + 'latest.bin';
+const FW_META = FW_BASE + 'version.json';   // optional: {"version":"1.1","notes":"..."}
+
+let fwRemoteVer = null;   // version string from version.json, or null if none
+let fwState = 'idle';     // idle | checking | ready | uptodate | error | flashing | done
+
 const otaCrc=(b,n)=>{ let s=0; for(let i=0;i<n;i++) s+=b[i]; return s&0xFF; };
 
+/* Entering the OTA screen: reset any finished state, then check the repo for
+   the latest firmware. Never runs mid-flash. */
 function otaResetView(){
-  /* Called when the OTA screen is opened and no transfer is running, so a
-     completed or abandoned update never leaves a stale bar or file behind. */
   if(otaBusy) return;
-  fwBuf = null; otaDone = false; otaCancel = false;
+  fwBuf = null; otaDone = false; otaCancel = false; fwState = 'idle';
   setOtaPct(0);
   $('otaProg').hidden = true;
-  $('otaLede').textContent = ble.state === LINK.CONNECTED && ble.otaChr
-    ? 'Pick a firmware file to install on this stump.'
-    : 'Connect to the stump to update its firmware.';
+  otaCheck();
 }
 
 function paintOta(){
-  const ready = ble.state === LINK.CONNECTED && ble.otaChr;
-  $('btnOtaPick').disabled  = !ready || otaBusy;
-  $('btnOtaStart').hidden   = !fwBuf || otaBusy;
-  $('btnOtaStart').disabled = !ready || otaBusy;
-  $('btnOtaCancel').hidden  = !otaBusy;
-  $('otaProg').hidden       = !otaBusy && !fwBuf;
-  if(!ready && !otaBusy){
+  const connected = ble.state === LINK.CONNECTED && ble.otaChr;
+  const canInstall = connected && fwState === 'ready' && !!fwBuf && !otaBusy;
+
+  $('btnOtaStart').hidden  = !(canInstall || (fwState === 'uptodate' && connected && !otaBusy));
+  $('btnOtaStart').disabled = !connected || otaBusy || !fwBuf;
+  $('btnOtaStart').textContent = fwState === 'uptodate' ? 'Reinstall' : 'Install update';
+
+  $('btnOtaRetry').hidden  = otaBusy || fwState !== 'error';
+  $('btnOtaCancel').hidden = !otaBusy;
+  $('otaProg').hidden      = !otaBusy && !otaDone;
+
+  /* Lede reflects the current state unless a flash is narrating its own,
+     or a terminal message (done/failed) is showing. */
+  if(otaBusy || otaDone) return;
+  if(!connected){
     $('otaLede').textContent = 'Connect to the stump to update its firmware.';
+  } else if(fwState === 'checking'){
+    $('otaLede').textContent = 'Checking for the latest firmware…';
+  } else if(fwState === 'error'){
+    /* message already set by otaCheck() */
+  } else if(fwState === 'uptodate'){
+    $('otaLede').textContent = fwRemoteVer
+      ? `You're on the latest firmware (v${fwRemoteVer}).`
+      : "You're on the latest firmware.";
+  } else if(fwState === 'ready'){
+    const size = fwBuf ? ` · ${(fwBuf.length/1024).toFixed(0)} KB` : '';
+    $('otaLede').textContent = fwRemoteVer
+      ? `Firmware v${fwRemoteVer} is available${size}. Install to update.`
+      : `New firmware is available${size}. Install to update.`;
   }
+}
+
+/* Fetch metadata (optional) + the .bin, validate it, and decide whether an
+   update is offered. Fully guarded: any failure leaves the stump untouched
+   and shows a Retry. */
+async function otaCheck(){
+  if(otaBusy) return;
+  if(!(ble.state === LINK.CONNECTED && ble.otaChr)){ fwState = 'idle'; paintOta(); return; }
+
+  otaDone = false;                    /* clear any prior terminal state */
+  fwState = 'checking'; fwBuf = null; setOtaPct(0); $('otaProg').hidden = true; paintOta();
+
+  /* 1) Optional version.json. Absent or malformed is fine — we just can't
+        compare versions, so we offer the update rather than block it. */
+  fwRemoteVer = null;
+  try {
+    const r = await fetch(FW_META, { cache: 'no-store' });
+    if(r.ok){
+      const j = await r.json();
+      if(j && typeof j.version === 'string') fwRemoteVer = j.version.trim();
+    }
+  } catch { /* no metadata — continue */ }
+
+  /* Already on the latest? Offer a reinstall but mark it up-to-date. We still
+     download the bin so Reinstall is instant and validated. */
+  const upToDate = fwRemoteVer && fwVersion &&
+                   String(fwRemoteVer).toLowerCase() === String(fwVersion).toLowerCase();
+
+  /* 2) The image itself. Download the WHOLE thing before we touch the stump:
+        a network drop must never leave a half-written slot. */
+  try {
+    const r = await fetch(FW_BIN, { cache: 'no-store' });
+    if(!r.ok) throw new Error(`server returned ${r.status}`);
+    const buf = new Uint8Array(await r.arrayBuffer());
+
+    /* Validate: non-trivial size + ESP image magic byte. Catches a 404 page,
+       an empty file, or a wrong artifact before it can reach the flash. */
+    if(buf.length < 1024) throw new Error('file too small to be firmware');
+    if(buf[0] !== 0xE9)   throw new Error('not a valid ESP firmware image');
+
+    fwBuf = buf;
+    fwState = upToDate ? 'uptodate' : 'ready';
+  } catch(err){
+    fwBuf = null;
+    fwState = 'error';
+    $('otaLede').textContent = /Failed to fetch|NetworkError|Load failed/i.test(err.message)
+      ? 'Could not reach the firmware server. Check the connection and retry.'
+      : `Could not load firmware: ${err.message}.`;
+  }
+  paintOta();
 }
 
 function setOtaPct(p){
@@ -4876,20 +4957,13 @@ function otaDataFrame(seq,part){ const len=part.length; const f=new Uint8Array(6
   f[0]=OTA_SOF; f[1]=OTA_DATA; f[2]=seq&0xFF; f[3]=(seq>>8)&0xFF; f[4]=len&0xFF; f[5]=(len>>8)&0xFF;
   f.set(part,6); f[6+len]=otaCrc(f,6+len); f[6+len+1]=OTA_EOF; return f; }
 
-$('btnOtaPick').onclick = () => $('otaFile').click();
-$('otaFile').onchange = async (e) => {
-  const file = e.target.files[0]; if(!file) return;
-  fwBuf = new Uint8Array(await file.arrayBuffer());
-  $('otaLede').textContent = `${file.name} · ${(fwBuf.length/1024).toFixed(0)} KB. Install when ready.`;
-  setOtaPct(0);
-  paintOta();
-};
+$('btnOtaRetry').onclick  = () => otaCheck();
 $('btnOtaCancel').onclick = () => { otaCancel = true; };
-$('btnOtaStart').onclick = () => otaFlash();
+$('btnOtaStart').onclick  = () => otaFlash();
 
 async function otaFlash(){
   if(!fwBuf || !ble.otaChr || otaBusy) return;
-  otaBusy = true; otaCancel = false;
+  otaBusy = true; otaCancel = false; otaDone = false; fwState = 'flashing';
   let payload = 504;                 // starts high; auto-shrinks to the MTU
   const timeout = 3000;
   const total = fwBuf.length;
@@ -4934,16 +5008,22 @@ async function otaFlash(){
     await otaWrite(otaCtrlEnd());
     await ackP;
     setOtaPct(100);
+    otaDone = true; fwState = 'done';
     $('otaLede').textContent = 'Update complete — the stump is rebooting into the new firmware.';
     $('btnOtaCancel').hidden = true;
   } catch(err){
+    otaDone = true; fwState = 'failed';
     $('otaLede').textContent = otaCancel
       ? 'Update cancelled. The stump kept its current firmware.'
       : `Update failed: ${err.message}. The stump kept its current firmware.`;
     setOtaPct(0);
   } finally {
     otaBusy = false;
-    paintOta();
+    /* Terminal states own their own message + bar; only refresh the buttons.
+       A fresh re-entry to the screen calls otaResetView -> otaCheck. */
+    $('btnOtaStart').hidden  = true;
+    $('btnOtaRetry').hidden  = (fwState !== 'failed');
+    $('btnOtaCancel').hidden = true;
   }
 }
 
