@@ -5081,11 +5081,29 @@ async function otaFlash(){
           if(otaNak){ if(otaNak.fatal) throw new Error('device error'); throw otaNak; }
 
           const part = fwBuf.subarray(off, Math.min(off + payload, total));
-          await otaWrite(otaDataFrame(seq, part), WRITE_MS);   // write-response paces us
-          sentFrames++; off += part.length; seq++;
+          const frame = otaDataFrame(seq, part);
 
-          /* Progress from the device's own ack counter when it's flowing, but
-             never block on it — it only drives the bar. */
+          /* Write with response. If the device couldn't queue the frame it
+             rejects the write (INSUFFICIENT_RES) — a transient "receiver busy",
+             NOT a lost frame. Retry the SAME frame a few times with a short
+             backoff so no bytes are ever skipped. Only give up (fail the run)
+             if it stays busy, which means the device is genuinely stuck. */
+          let wrote = false;
+          for(let tries = 0; tries < 8 && !wrote; tries++){
+            if(otaCancel) throw Object.assign(new Error('cancelled'), {cancelled:true});
+            try {
+              await otaWrite(frame, WRITE_MS);
+              wrote = true;
+            } catch(werr){
+              if(werr.cancelled || otaCancel) throw Object.assign(new Error('cancelled'), {cancelled:true});
+              /* A rejected/failed write: the device is momentarily busy. Wait a
+                 beat and resend the same frame. */
+              await new Promise(r => setTimeout(r, 30 + tries*20));
+            }
+          }
+          if(!wrote) throw new Error('the stump could not keep up');
+
+          sentFrames++; off += part.length; seq++;
           setOtaPct(Math.min(99, off * 100 / total));
         }
 
