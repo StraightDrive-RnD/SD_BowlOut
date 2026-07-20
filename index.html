@@ -4939,42 +4939,39 @@ function setOtaPct(p, force){
   $('otaPct').textContent  = v.toFixed(0) + '%';
 }
 
-/* Ack routing. The device acks control frames (START/END/ABORT) singly, and
-   DATA frames in the exact order it received them. We keep a FIFO of waiters:
-   each notify resolves/rejects the oldest waiter. This lets many DATA frames
-   be in flight at once (the pipeline) while still matching every ack. */
-let otaWaiters = [];        // {resolve, reject, timer}
-function otaSettleNext(ok, err){
-  const w = otaWaiters.shift();
-  if(!w) return;
-  clearTimeout(w.timer);
-  ok ? w.resolve() : w.reject(err);
-}
+/* Counter-based acking (robust to a dropped or late notify).
+
+   The device writes DATA frames to flash in order and sends one OK per frame.
+   We do NOT try to match each ack to a specific frame — positional matching
+   is fragile: a single dropped notify would desync the whole stream and doom
+   the tail (the classic "100% then restart"). Instead we simply COUNT acks.
+   The transfer is healthy as long as the ack count keeps up with the send
+   count; a NAK/ERROR from the device is the only hard failure. */
+let otaAcked = 0;           // OK acks received this run
+let otaNak   = null;        // set to an Error if the device FAILs/ERRORs
+function otaResetAckState(){ otaAcked = 0; otaNak = null; }
 function onOtaNotify(dv){
   const v = new Uint8Array(dv.buffer);
   if(v.length < 3 || v[0] !== OTA_SOF) return;
   const code = v[1];
   if(code === OTA_PROG){ if(otaBusy) setOtaPct(v[2]); return; }
-  if(code === OTA_OK)        otaSettleNext(true);
-  else if(code === OTA_FAIL) otaSettleNext(false, Object.assign(new Error('FAIL'), {retry:true}));
-  else if(code === OTA_ERR)  otaSettleNext(false, Object.assign(new Error('ERROR'), {fatal:true}));
+  if(code === OTA_OK)        otaAcked++;
+  else if(code === OTA_FAIL) otaNak = Object.assign(new Error('device rejected a frame'), {retry:true});
+  else if(code === OTA_ERR)  otaNak = Object.assign(new Error('device error'), {fatal:true});
 }
 
-/* Enqueue a waiter for the next ack, with its own timeout. */
-function otaAck(ms){
-  return new Promise((resolve,reject)=>{
-    const w = {resolve, reject, timer:null};
-    w.timer = setTimeout(()=>{
-      const i = otaWaiters.indexOf(w);
-      if(i >= 0) otaWaiters.splice(i, 1);
-      reject(new Error('ack timeout'));
-    }, ms);
-    otaWaiters.push(w);
-  });
-}
-function otaClearWaiters(){
-  for(const w of otaWaiters){ clearTimeout(w.timer); }
-  otaWaiters = [];
+/* Wait until at least `target` acks have arrived, or the device NAKs, or we
+   time out. Returns normally on success; throws on NAK/ERROR/timeout. */
+async function otaWaitAcks(target, ms){
+  const deadline = (typeof performance!=='undefined'?performance.now():Date.now()) + ms;
+  for(;;){
+    if(otaNak) throw otaNak;
+    if(otaCancel) throw Object.assign(new Error('cancelled'), {cancelled:true});
+    if(otaAcked >= target) return;
+    const now = (typeof performance!=='undefined'?performance.now():Date.now());
+    if(now >= deadline) throw new Error('ack timeout');
+    await new Promise(r => setTimeout(r, 10));
+  }
 }
 /* Rejects as soon as the user cancels, so any await racing against it unblocks
    immediately instead of waiting for a dead device. Re-armed each flash. */
@@ -5019,7 +5016,7 @@ async function otaFlash(){
   if(!fwBuf || !ble.otaChr || otaBusy) return;
   otaBusy = true; otaCancel = false; otaDone = false; fwState = 'flashing';
   otaCancelWake = null;
-  otaClearWaiters();
+  otaResetAckState();
 
   const total = fwBuf.length;
   paintOta(); setOtaPct(0);
@@ -5058,70 +5055,95 @@ async function otaFlash(){
       }
 
       try {
-        otaClearWaiters();
+        otaResetAckState();
         // START — the device pre-erases the target slot here (a few seconds).
-        let startAck = otaAck(15000);
         await otaWrite(otaCtrlStart(total), 16000);
-        await Promise.race([ startAck, cancelSignal() ]);
+        await otaWaitAcks(1, 15000);          // START OK (counter: first ack)
+        let startBaseline = otaAcked;         // acks beyond this are DATA acks
 
-        // Stream the image, keeping WINDOW frames in flight.
-        let off = 0, seq = 0, confirmed = 0;
-        const pending = [];   // {p} entries whose rejection is captured, oldest first
-
-        /* Wrap an ack promise so a timeout/NAK doesn't throw loose while it
-           sits un-awaited in the window; we settle it explicitly on drain. */
-        const track = (ackP) => {
-          const e = { done:false, err:null };
-          e.p = ackP.then(()=>{ e.done=true; }, (err)=>{ e.done=true; e.err=err; });
-          return e;
-        };
-        const drainOne = async () => {
-          const e = pending.shift();
-          await Promise.race([ e.p, cancelSignal() ]);   // wait for it to settle
-          if(otaCancel) throw Object.assign(new Error('cancelled'), {cancelled:true});
-          if(e.err) throw e.err;                          // surface the ack failure now
-          confirmed += payload;
-        };
+        /* Stream the image. Flow control by COUNTER: keep the number of
+           in-flight (sent-but-unacked) frames <= WINDOW. We never match an
+           ack to a specific frame, so a single dropped/late notify can't
+           desync the stream — it just means the ack counter is briefly behind
+           and we wait for it. */
+        let off = 0, seq = 0, sentFrames = 0, tailShort = 0;
+        const dataAcked = () => otaAcked - startBaseline;
 
         while(off < total){
           if(otaCancel) throw Object.assign(new Error('cancelled'), {cancelled:true});
-          // Top up the window.
-          while(pending.length < WINDOW && off < total){
-            const part = fwBuf.subarray(off, Math.min(off + payload, total));
-            const ackP = otaAck(6000);                     // waiter enqueued in order (device may retry a late notify)
-            await otaWrite(otaDataFrame(seq, part), WRITE_MS);
-            pending.push(track(ackP));
-            off += part.length; seq++;
-          }
-          // Block only when the window is full: drain the oldest, freeing a slot.
-          if(pending.length >= WINDOW) await drainOne();
-          setOtaPct(Math.min(99, confirmed * 100 / total));
-        }
-        // Drain the tail.
-        while(pending.length) await drainOne();
+          if(otaNak){ if(otaNak.fatal) throw new Error('device error'); throw otaNak; }
 
-        setOtaPct(100, true);   // force the final paint
-        /* Clear any stray waiters so the END ack is matched cleanly, and let
-           the device settle after the last write before we ask it to finalize. */
-        otaClearWaiters();
+          // Flow control: if we're WINDOW frames ahead of the confirmed acks,
+          // wait for the gap to shrink. Tolerant: we don't demand an exact
+          // count (a truly-dropped notify would stall that forever) — we wait
+          // until the gap is back within the window, or bail on NAK/timeout.
+          if(sentFrames - dataAcked() >= WINDOW){
+            const target = sentFrames - WINDOW + 1;   // in DATA-ack units
+            const t0 = (typeof performance!=='undefined'?performance.now():Date.now());
+            while(dataAcked() < target){
+              if(otaNak){ if(otaNak.fatal) throw new Error('device error'); throw otaNak; }
+              if(otaCancel) throw Object.assign(new Error('cancelled'), {cancelled:true});
+              const now = (typeof performance!=='undefined'?performance.now():Date.now());
+              if(now - t0 > 6000) throw new Error('the stump stopped responding');
+              await new Promise(r => setTimeout(r, 10));
+            }
+          }
+
+          const part = fwBuf.subarray(off, Math.min(off + payload, total));
+          await otaWrite(otaDataFrame(seq, part), WRITE_MS);
+          sentFrames++; off += part.length; seq++;
+
+          // Progress from confirmed acks (never runs ahead of the device).
+          setOtaPct(Math.min(99, dataAcked() * payload * 100 / total));
+        }
+
+        /* Tail: wait for the acks to catch up to the frames we sent. Tolerate
+           a small shortfall — a dropped notify or two at the very end must not
+           throw the whole image away. The device processes END from the SAME
+           in-order queue, so any straggler DATA frames are written before END
+           is handled; a slightly-short ack count is safe. */
+        try {
+          await otaWaitAcks(startBaseline + sentFrames, 8000);
+        } catch(tailErr){
+          if(tailErr.cancelled || otaCancel) throw Object.assign(new Error('cancelled'), {cancelled:true});
+          if(otaNak && otaNak.fatal) throw new Error('device error');
+          if(otaNak) throw otaNak;
+          const short = sentFrames - dataAcked();
+          /* The device writes every frame it receives, in order, and only a
+             dropped NOTIFY leaves the ack missing (the device didn't fail —
+             otaNak would be set). Tolerate a small number of missing acks:
+             a handful of dropped notifies across a whole image is normal on a
+             busy link and does NOT mean the flash is short. Restart only if a
+             large fraction is missing (a genuinely broken link). */
+          const tol = Math.max(3, Math.ceil(sentFrames * 0.02));   // ~2%, min 3
+          if(short > tol) throw new Error('the stump stopped responding');
+          tailShort = short;
+        }
+
+        setOtaPct(100, true);
         await new Promise(r => setTimeout(r, 150));
 
-        /* END — the device validates the image, sets the boot slot, and
-           reboots. Its OK ack may not arrive before it resets, so we treat a
-           timeout here (after all data was sent and acked) as SUCCESS rather
-           than restarting the whole image. Only an explicit device ERROR/NAK
-           means the image was bad. */
+        /* END — validate + boot switch + reboot. The device may reset before
+           its OK ack leaves the radio, so a missing END ack after a full
+           transfer is treated as SUCCESS. Only an explicit NAK/ERROR means the
+           image was bad. */
+        otaNak = null;
+        const endBase = otaAcked;
+        await otaWrite(otaCtrlEnd(), 8000);
         try {
-          const endAck = otaAck(10000);
-          await otaWrite(otaCtrlEnd(), 8000);
-          await Promise.race([ endAck, cancelSignal() ]);
-          done = true;                       // clean ack
+          await otaWaitAcks(endBase + 1, 10000);   // explicit END OK
+          done = true;
         } catch(endErr){
           if(endErr.cancelled || otaCancel) throw Object.assign(new Error('cancelled'), {cancelled:true});
-          if(endErr.fatal) throw new Error('device error');   // real rejection -> restart
-          /* Ack timeout after a full, acked data transfer: the device almost
-             certainly received END and is rebooting. Accept it. */
-          done = true;
+          if(otaNak && otaNak.fatal) throw new Error('device error');
+          if(otaNak) throw otaNak;
+          /* Timeout with no NAK. If every data frame was acked, the image is
+             certainly complete and the device just rebooted before its END ack
+             flushed -> success. If some data acks were missing, we can't be
+             sure the device didn't reject a short image with an ERROR we then
+             missed -> restart to be safe. */
+          if(tailShort === 0) done = true;
+          else throw new Error('could not confirm the update finished');
         }
 
       } catch(runErr){
@@ -5131,7 +5153,7 @@ async function otaFlash(){
            device's OTA state and re-erases), so retrying the whole image at a
            smaller payload is the right move for any of them. Only after every
            payload size is exhausted do we surface a failure. */
-        otaClearWaiters();
+        otaResetAckState();
         // Best-effort ABORT so the device leaves OTA state before we restart.
         try{ await Promise.race([ ble.otaChr.writeValueWithResponse(otaCtrlAbort()),
                                   new Promise(r=>setTimeout(r,600)) ]); }catch(_){}
