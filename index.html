@@ -4925,23 +4925,42 @@ function setOtaPct(p){
   $('otaPct').textContent  = v.toFixed(0) + '%';
 }
 
+/* Ack routing. The device acks control frames (START/END/ABORT) singly, and
+   DATA frames in the exact order it received them. We keep a FIFO of waiters:
+   each notify resolves/rejects the oldest waiter. This lets many DATA frames
+   be in flight at once (the pipeline) while still matching every ack. */
+let otaWaiters = [];        // {resolve, reject, timer}
+function otaSettleNext(ok, err){
+  const w = otaWaiters.shift();
+  if(!w) return;
+  clearTimeout(w.timer);
+  ok ? w.resolve() : w.reject(err);
+}
 function onOtaNotify(dv){
   const v = new Uint8Array(dv.buffer);
   if(v.length < 3 || v[0] !== OTA_SOF) return;
   const code = v[1];
   if(code === OTA_PROG){ if(otaBusy) setOtaPct(v[2]); return; }
-  const p = otaPendingAck; if(!p) return;
-  clearTimeout(p.timer); otaPendingAck = null;
-  if(code === OTA_OK)        p.resolve();
-  else if(code === OTA_FAIL) p.reject(Object.assign(new Error('FAIL'), {retry:true}));
-  else if(code === OTA_ERR)  p.reject(Object.assign(new Error('ERROR'), {fatal:true}));
+  if(code === OTA_OK)        otaSettleNext(true);
+  else if(code === OTA_FAIL) otaSettleNext(false, Object.assign(new Error('FAIL'), {retry:true}));
+  else if(code === OTA_ERR)  otaSettleNext(false, Object.assign(new Error('ERROR'), {fatal:true}));
 }
 
+/* Enqueue a waiter for the next ack, with its own timeout. */
 function otaAck(ms){
   return new Promise((resolve,reject)=>{
-    const timer=setTimeout(()=>{ otaPendingAck=null; reject(new Error('ack timeout')); },ms);
-    otaPendingAck={resolve,reject,timer};
+    const w = {resolve, reject, timer:null};
+    w.timer = setTimeout(()=>{
+      const i = otaWaiters.indexOf(w);
+      if(i >= 0) otaWaiters.splice(i, 1);
+      reject(new Error('ack timeout'));
+    }, ms);
+    otaWaiters.push(w);
   });
+}
+function otaClearWaiters(){
+  for(const w of otaWaiters){ clearTimeout(w.timer); }
+  otaWaiters = [];
 }
 /* Rejects as soon as the user cancels, so any await racing against it unblocks
    immediately instead of waiting for a dead device. Re-armed each flash. */
@@ -4986,56 +5005,101 @@ async function otaFlash(){
   if(!fwBuf || !ble.otaChr || otaBusy) return;
   otaBusy = true; otaCancel = false; otaDone = false; fwState = 'flashing';
   otaCancelWake = null;
-  let payload = 504;                 // starts high; auto-shrinks to the MTU
-  const timeout = 3000;
+  otaClearWaiters();
+
   const total = fwBuf.length;
   paintOta(); setOtaPct(0);
   $('otaLede').textContent = 'Updating — keep the app open and the stump powered.';
 
   try {
-    // START (generous first-ack window: CCCD + conn-interval settle)
-    let ackP = otaAck(15000);   // START triggers a full slot erase (~3-6s, more on slow flash)
-    await otaWrite(otaCtrlStart(total), 16000);
-    await ackP;
+    /* Pipelined transfer with whole-run restart on failure.
 
-    let sent=0, seq=0, off=0, stallRetries=0;
-    const WRITE_MS = 4000;      // hard cap on a single BLE write
-    const MAX_STALLS = 6;       // consecutive unproductive tries before we give up
-    while(off < total){
+       The device writes DATA frames to flash in arrival order and, on ANY
+       per-frame error, aborts the whole OTA session. So we can't rewind and
+       resume mid-stream — instead we pipeline hard for speed, and if a run
+       fails we restart the ENTIRE image (fresh START) at a smaller payload.
+       In practice the first run at full size succeeds; the restart path is a
+       safety net for a flaky link. */
+    const WRITE_MS = 5000;
+    const WINDOW = 16;                       // frames in flight (< device queue 24)
+    const PAYLOADS = [512, 256, 128, 64];    // tried in order across restarts
+    let attempt = 0, done = false;
+
+    for(attempt = 0; attempt < PAYLOADS.length && !done; attempt++){
+      const payload = PAYLOADS[attempt];
       if(otaCancel) throw Object.assign(new Error('cancelled'), {cancelled:true});
-
-      const part = fwBuf.subarray(off, Math.min(off+payload, total));
-      let acked=false, shrank=false;
-      try{
-        ackP = otaAck(timeout);
-        await otaWrite(otaDataFrame(seq, part), WRITE_MS);   // capped write + cancel-aware
-        await Promise.race([ ackP, cancelSignal() ]);         // ack, or cancel breaks in
-        acked=true;
-      }catch(e){
-        if(e.cancelled || otaCancel) throw Object.assign(new Error('cancelled'), {cancelled:true});
-        if(e.fatal) throw new Error('device error');
-        /* A NAK, an ack timeout, or a write timeout: shrink the chunk and retry.
-           Shrinking often clears a device-side buffer stall (the classic freeze
-           part-way through). Cap total unproductive tries so we never loop
-           forever — fail cleanly instead, which frees the UI and Cancel. */
-        if(payload > 64){ payload = Math.max(64, Math.floor(payload/2)); shrank=true; }
-        if(++stallRetries > MAX_STALLS)
-          throw new Error('the stump stopped responding');
+      if(attempt > 0){
+        $('otaLede').textContent = `Retrying at a safer speed (${payload} B chunks)…`;
+        await new Promise(r => setTimeout(r, 200));
       }
-      if(!acked){ if(shrank) continue; else continue; }
-      stallRetries = 0;                    // productive chunk: reset the stall counter
-      sent+=part.length; off+=part.length; seq++;
-      setOtaPct(sent*100/total);
-      /* Yield ~8 ms between chunks so the BLE stack and the device's notify
-         buffer drain. Cheap insurance against a mid-transfer wedge, and it
-         also lets a queued Cancel be seen. */
-      await new Promise(r => setTimeout(r, 8));
+
+      try {
+        otaClearWaiters();
+        // START — the device pre-erases the target slot here (a few seconds).
+        let startAck = otaAck(15000);
+        await otaWrite(otaCtrlStart(total), 16000);
+        await Promise.race([ startAck, cancelSignal() ]);
+
+        // Stream the image, keeping WINDOW frames in flight.
+        let off = 0, seq = 0, confirmed = 0;
+        const pending = [];   // {p} entries whose rejection is captured, oldest first
+
+        /* Wrap an ack promise so a timeout/NAK doesn't throw loose while it
+           sits un-awaited in the window; we settle it explicitly on drain. */
+        const track = (ackP) => {
+          const e = { done:false, err:null };
+          e.p = ackP.then(()=>{ e.done=true; }, (err)=>{ e.done=true; e.err=err; });
+          return e;
+        };
+        const drainOne = async () => {
+          const e = pending.shift();
+          await Promise.race([ e.p, cancelSignal() ]);   // wait for it to settle
+          if(otaCancel) throw Object.assign(new Error('cancelled'), {cancelled:true});
+          if(e.err) throw e.err;                          // surface the ack failure now
+          confirmed += payload;
+        };
+
+        while(off < total){
+          if(otaCancel) throw Object.assign(new Error('cancelled'), {cancelled:true});
+          // Top up the window.
+          while(pending.length < WINDOW && off < total){
+            const part = fwBuf.subarray(off, Math.min(off + payload, total));
+            const ackP = otaAck(4000);                     // waiter enqueued in order
+            await otaWrite(otaDataFrame(seq, part), WRITE_MS);
+            pending.push(track(ackP));
+            off += part.length; seq++;
+          }
+          // Block only when the window is full: drain the oldest, freeing a slot.
+          if(pending.length >= WINDOW) await drainOne();
+          setOtaPct(Math.min(99, confirmed * 100 / total));
+        }
+        // Drain the tail.
+        while(pending.length) await drainOne();
+
+        setOtaPct(100);
+        // END — image validation + boot switch.
+        let endAck = otaAck(8000);
+        await otaWrite(otaCtrlEnd(), 8000);
+        await Promise.race([ endAck, cancelSignal() ]);
+        done = true;
+
+      } catch(runErr){
+        if(runErr.cancelled || otaCancel) throw Object.assign(new Error('cancelled'), {cancelled:true});
+        /* A device ERROR, a NAK, or an ack timeout all land here. We don't
+           distinguish: the restart path does a fresh START (which resets the
+           device's OTA state and re-erases), so retrying the whole image at a
+           smaller payload is the right move for any of them. Only after every
+           payload size is exhausted do we surface a failure. */
+        otaClearWaiters();
+        // Best-effort ABORT so the device leaves OTA state before we restart.
+        try{ await Promise.race([ ble.otaChr.writeValueWithResponse(otaCtrlAbort()),
+                                  new Promise(r=>setTimeout(r,600)) ]); }catch(_){}
+        setOtaPct(0);
+        if(attempt >= PAYLOADS.length - 1) throw new Error('the stump stopped responding');
+        // else loop restarts at the next-smaller payload
+      }
     }
 
-    // END (validation can take a moment)
-    ackP = otaAck(8000);
-    await otaWrite(otaCtrlEnd(), 8000);
-    await ackP;
     setOtaPct(100);
     otaDone = true; fwState = 'done';
     $('otaLede').textContent = 'Update complete — the stump is rebooting into the new firmware.';
