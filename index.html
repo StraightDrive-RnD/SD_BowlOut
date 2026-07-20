@@ -4888,17 +4888,26 @@ function paintOta(){
 function fwVersionFromBin(buf){
   try {
     if(!buf || buf.length < 96) return null;
-    const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
-    const magic = dv.getUint32(32, true);        // esp_app_desc_t.magic_word
-    if(magic !== 0xABCD5432) return null;         // not where we expect -> bail
-    let str = '';
-    for(let i = 48; i < 80; i++){                 // version[32] at offset 48
-      const c = buf[i];
-      if(c === 0) break;
-      str += String.fromCharCode(c);
+    /* The esp_app_desc_t begins with the magic word 0xABCD5432, then 16 bytes
+       later carries version[32]. The descriptor normally sits at offset 32,
+       but the image header size can vary between builds, so rather than assume
+       a fixed offset we SCAN the first 1 KB for the magic (little-endian bytes
+       32 54 CD AB) and read the version 16 bytes after it. Robust to any
+       header layout. */
+    const N = Math.min(buf.length - 52, 1024);
+    for(let i = 0; i < N; i++){
+      if(buf[i]===0x32 && buf[i+1]===0x54 && buf[i+2]===0xCD && buf[i+3]===0xAB){
+        let str = '';
+        for(let j = i + 16; j < i + 48; j++){     // version[32] at magic+16
+          const c = buf[j];
+          if(c === 0) break;
+          str += String.fromCharCode(c);
+        }
+        str = str.trim();
+        return str.length ? str : null;
+      }
     }
-    str = str.trim();
-    return str.length ? str : null;
+    return null;                                   // no descriptor found
   } catch { return null; }
 }
 
