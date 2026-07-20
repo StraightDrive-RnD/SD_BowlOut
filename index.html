@@ -269,6 +269,13 @@ h1{font-family:var(--disp);font-weight:800;font-size:clamp(34px,10vw,52px);line-
 
 /* About */
 #about,#ota{padding-top:22px}
+/* The update screen repaints fast (progress %). Prevent Android's
+   text-selection popup / copy toolbar and callouts from firing on those
+   rapid updates by making this screen non-selectable. */
+#ota, #ota *{
+  -webkit-user-select:none; user-select:none;
+  -webkit-touch-callout:none;
+}
 .abrow{display:flex;justify-content:space-between;align-items:baseline;
   border-bottom:1px solid var(--line);padding:14px 0}
 .ablabel{font-family:var(--data);font-size:12px;letter-spacing:.14em;
@@ -4919,8 +4926,15 @@ async function otaCheck(){
   paintOta();
 }
 
-function setOtaPct(p){
+let _otaPctLast = -1, _otaPctAt = 0;
+function setOtaPct(p, force){
   const v = Math.max(0, Math.min(100, p));
+  const now = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+  /* Throttle DOM writes to ~5/sec. Updating the bar hundreds of times a second
+     thrashes layout and can trigger Android's text-selection/toast popups. */
+  if(!force && Math.round(v) === _otaPctLast) return;
+  if(!force && now - _otaPctAt < 200) return;
+  _otaPctLast = Math.round(v); _otaPctAt = now;
   $('otaFill').style.width = v + '%';
   $('otaPct').textContent  = v.toFixed(0) + '%';
 }
@@ -5086,12 +5100,29 @@ async function otaFlash(){
         // Drain the tail.
         while(pending.length) await drainOne();
 
-        setOtaPct(100);
-        // END — image validation + boot switch.
-        let endAck = otaAck(8000);
-        await otaWrite(otaCtrlEnd(), 8000);
-        await Promise.race([ endAck, cancelSignal() ]);
-        done = true;
+        setOtaPct(100, true);   // force the final paint
+        /* Clear any stray waiters so the END ack is matched cleanly, and let
+           the device settle after the last write before we ask it to finalize. */
+        otaClearWaiters();
+        await new Promise(r => setTimeout(r, 150));
+
+        /* END — the device validates the image, sets the boot slot, and
+           reboots. Its OK ack may not arrive before it resets, so we treat a
+           timeout here (after all data was sent and acked) as SUCCESS rather
+           than restarting the whole image. Only an explicit device ERROR/NAK
+           means the image was bad. */
+        try {
+          const endAck = otaAck(10000);
+          await otaWrite(otaCtrlEnd(), 8000);
+          await Promise.race([ endAck, cancelSignal() ]);
+          done = true;                       // clean ack
+        } catch(endErr){
+          if(endErr.cancelled || otaCancel) throw Object.assign(new Error('cancelled'), {cancelled:true});
+          if(endErr.fatal) throw new Error('device error');   // real rejection -> restart
+          /* Ack timeout after a full, acked data transfer: the device almost
+             certainly received END and is rebooting. Accept it. */
+          done = true;
+        }
 
       } catch(runErr){
         if(runErr.cancelled || otaCancel) throw Object.assign(new Error('cancelled'), {cancelled:true});
@@ -5110,7 +5141,7 @@ async function otaFlash(){
       }
     }
 
-    setOtaPct(100);
+    setOtaPct(100, true);
     otaDone = true; fwState = 'done';
     $('otaLede').textContent = 'Update complete — the stump is rebooting into the new firmware.';
     $('btnOtaCancel').hidden = true;
