@@ -5037,9 +5037,15 @@ async function otaFlash(){
        notify load), so shrinking the window matters as much as the chunk. The
        first setting is already conservative enough to complete on a healthy
        link; the rest are safety nets. */
+    /* Payload sizes chosen to fit inside ONE ATT write on a typical negotiated
+       MTU. Chrome-on-Android usually lands around MTU 247 (244 usable). A
+       frame is payload+8, so a 240-byte payload -> 248-byte frame fits without
+       the BLE stack fragmenting it — fragmentation was delivering spurious
+       short writes that aborted the transfer. We start at 240 and fall back
+       smaller if a run still fails. */
     const RUNS = [
-      { payload: 512, window: 8 },
-      { payload: 256, window: 6 },
+      { payload: 240, window: 8 },
+      { payload: 180, window: 6 },
       { payload: 128, window: 4 },
       { payload:  64, window: 2 },
     ];
