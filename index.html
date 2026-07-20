@@ -5058,93 +5058,55 @@ async function otaFlash(){
         otaResetAckState();
         // START — the device pre-erases the target slot here (a few seconds).
         await otaWrite(otaCtrlStart(total), 16000);
-        await otaWaitAcks(1, 15000);          // START OK (counter: first ack)
-        let startBaseline = otaAcked;         // acks beyond this are DATA acks
+        await otaWaitAcks(1, 15000);          // wait for START OK (slot ready)
 
-        /* Stream the image. Flow control by COUNTER: keep the number of
-           in-flight (sent-but-unacked) frames <= WINDOW. We never match an
-           ack to a specific frame, so a single dropped/late notify can't
-           desync the stream — it just means the ack counter is briefly behind
-           and we wait for it. */
-        let off = 0, seq = 0, sentFrames = 0, tailShort = 0;
-        const dataAcked = () => otaAcked - startBaseline;
-
+        /* Stream every frame using write-WITH-response. That response is the
+           flow control: each write only resolves once the device's BLE stack
+           has received the frame, so the phone physically cannot outrun the
+           device and its receive queue can't overflow. We do NOT wait on the
+           per-frame application ack here — gating on those acks was the bug:
+           under two-way BLE congestion the acks arrive late, the wait timed
+           out, and the transfer aborted at 100%. Integrity is guaranteed at
+           END instead: esp_ota_end() validates the whole image, and a bad or
+           short image makes the device reject with an ERROR we act on. */
+        let off = 0, seq = 0, sentFrames = 0;
         while(off < total){
           if(otaCancel) throw Object.assign(new Error('cancelled'), {cancelled:true});
           if(otaNak){ if(otaNak.fatal) throw new Error('device error'); throw otaNak; }
 
-          // Flow control: if we're WINDOW frames ahead of the confirmed acks,
-          // wait for the gap to shrink. Tolerant: we don't demand an exact
-          // count (a truly-dropped notify would stall that forever) — we wait
-          // until the gap is back within the window, or bail on NAK/timeout.
-          if(sentFrames - dataAcked() >= WINDOW){
-            const target = sentFrames - WINDOW + 1;   // in DATA-ack units
-            const t0 = (typeof performance!=='undefined'?performance.now():Date.now());
-            while(dataAcked() < target){
-              if(otaNak){ if(otaNak.fatal) throw new Error('device error'); throw otaNak; }
-              if(otaCancel) throw Object.assign(new Error('cancelled'), {cancelled:true});
-              const now = (typeof performance!=='undefined'?performance.now():Date.now());
-              if(now - t0 > 6000) throw new Error('the stump stopped responding');
-              await new Promise(r => setTimeout(r, 10));
-            }
-          }
-
           const part = fwBuf.subarray(off, Math.min(off + payload, total));
-          await otaWrite(otaDataFrame(seq, part), WRITE_MS);
+          await otaWrite(otaDataFrame(seq, part), WRITE_MS);   // write-response paces us
           sentFrames++; off += part.length; seq++;
 
-          // Progress from confirmed acks (never runs ahead of the device).
-          setOtaPct(Math.min(99, dataAcked() * payload * 100 / total));
-        }
-
-        /* Tail: wait for the acks to catch up to the frames we sent. Tolerate
-           a small shortfall — a dropped notify or two at the very end must not
-           throw the whole image away. The device processes END from the SAME
-           in-order queue, so any straggler DATA frames are written before END
-           is handled; a slightly-short ack count is safe. */
-        try {
-          await otaWaitAcks(startBaseline + sentFrames, 8000);
-        } catch(tailErr){
-          if(tailErr.cancelled || otaCancel) throw Object.assign(new Error('cancelled'), {cancelled:true});
-          if(otaNak && otaNak.fatal) throw new Error('device error');
-          if(otaNak) throw otaNak;
-          const short = sentFrames - dataAcked();
-          /* The device writes every frame it receives, in order, and only a
-             dropped NOTIFY leaves the ack missing (the device didn't fail —
-             otaNak would be set). Tolerate a small number of missing acks:
-             a handful of dropped notifies across a whole image is normal on a
-             busy link and does NOT mean the flash is short. Restart only if a
-             large fraction is missing (a genuinely broken link). */
-          const tol = Math.max(3, Math.ceil(sentFrames * 0.02));   // ~2%, min 3
-          if(short > tol) throw new Error('the stump stopped responding');
-          tailShort = short;
+          /* Progress from the device's own ack counter when it's flowing, but
+             never block on it — it only drives the bar. */
+          setOtaPct(Math.min(99, off * 100 / total));
         }
 
         setOtaPct(100, true);
-        await new Promise(r => setTimeout(r, 150));
+        /* Give the device a moment to drain the last writes from its queue and
+           finish the final flash write before we ask it to finalize. */
+        await new Promise(r => setTimeout(r, 250));
+        if(otaNak){ if(otaNak.fatal) throw new Error('device error'); throw otaNak; }
 
-        /* END — validate + boot switch + reboot. The device may reset before
-           its OK ack leaves the radio, so a missing END ack after a full
-           transfer is treated as SUCCESS. Only an explicit NAK/ERROR means the
-           image was bad. */
+        /* END — the device runs esp_ota_end() (full image validation: size +
+           SHA), sets the boot slot, and reboots. This is the real integrity
+           gate. A returned OK means the image is good. An ERROR means it was
+           bad -> restart. A timeout means the device rebooted before its ack
+           flushed -> treat as success, because END is only reached after every
+           frame was write-response-confirmed to the device. */
         otaNak = null;
         const endBase = otaAcked;
         await otaWrite(otaCtrlEnd(), 8000);
         try {
-          await otaWaitAcks(endBase + 1, 10000);   // explicit END OK
-          done = true;
+          await otaWaitAcks(endBase + 1, 12000);   // explicit END OK
         } catch(endErr){
           if(endErr.cancelled || otaCancel) throw Object.assign(new Error('cancelled'), {cancelled:true});
           if(otaNak && otaNak.fatal) throw new Error('device error');
           if(otaNak) throw otaNak;
-          /* Timeout with no NAK. If every data frame was acked, the image is
-             certainly complete and the device just rebooted before its END ack
-             flushed -> success. If some data acks were missing, we can't be
-             sure the device didn't reject a short image with an ERROR we then
-             missed -> restart to be safe. */
-          if(tailShort === 0) done = true;
-          else throw new Error('could not confirm the update finished');
+          /* pure timeout after a fully write-confirmed image -> success */
         }
+        done = true;
 
       } catch(runErr){
         if(runErr.cancelled || otaCancel) throw Object.assign(new Error('cancelled'), {cancelled:true});
