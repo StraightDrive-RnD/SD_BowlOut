@@ -5121,13 +5121,14 @@ async function otaFlash(){
           const part = fwBuf.subarray(off, Math.min(off + payload, total));
           const frame = otaDataFrame(seq, part);
 
-          /* Write with response. If the device couldn't queue the frame it
-             rejects the write (INSUFFICIENT_RES) — a transient "receiver busy",
-             NOT a lost frame. Retry the SAME frame a few times with a short
-             backoff so no bytes are ever skipped. Only give up (fail the run)
-             if it stays busy, which means the device is genuinely stuck. */
+          /* Write with response. The device rejects the write (ATT error) if
+             the frame arrived corrupted (bad CRC) OR its receive queue is
+             momentarily full. Either way the frame was NOT accepted, so we
+             resend the SAME frame — never skip bytes. Corruption on a healthy
+             link is rare, so a handful of retries clears it; only give up if it
+             persists, which means the link is genuinely broken. */
           let wrote = false;
-          for(let tries = 0; tries < 8 && !wrote; tries++){
+          for(let tries = 0; tries < 12 && !wrote; tries++){
             if(otaCancel) throw Object.assign(new Error('cancelled'), {cancelled:true});
             try {
               await otaWrite(frame, WRITE_MS);
