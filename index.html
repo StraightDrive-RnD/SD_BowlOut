@@ -503,8 +503,18 @@ h1{font-family:var(--disp);font-weight:800;font-size:clamp(34px,10vw,52px);line-
    ══════════════════════════════════════════════════════════════════ */
 html.tv{overflow:hidden}
 html.tv body{
-  position:fixed;top:0;left:0;
-  width:100vh;height:100vw;
+  position:fixed;top:var(--tvY,0);left:var(--tvX,0);
+  /* NOT 100vh/100vw. On Android Chrome `vh` is the LARGE viewport — the
+     height the page would have if the toolbar were hidden — so out of
+     fullscreen it over-reports by the whole toolbar, and the rotated canvas
+     hangs off the edge of the screen taking the app's edges with it. Going
+     INTO fullscreen has the mirror problem: the viewport resizes
+     asynchronously, after the transition, so anything measured on the way in
+     is a frame late. There is no CSS unit that reliably means "what you can
+     actually see right now", so JS measures it and re-measures on every
+     event that can change it. The fallbacks only ever apply for the one
+     frame before the first measurement lands. */
+  width:var(--tvW,100vh);height:var(--tvH,100vw);
   transform-origin:top left;
 }
 /* Panel turned clockwise — its left edge is now the bottom. */
@@ -600,6 +610,18 @@ html.tv-ccw body{transform:rotate(-90deg) translateX(-100%)}
         <button id="segTvOff" aria-pressed="true">Off</button>
         <button id="segTvCw" aria-pressed="false">Right</button>
         <button id="segTvCcw" aria-pressed="false">Left</button>
+      </div>
+    </div>
+
+    <div class="setrow" id="tvInsetRow" hidden>
+      <div class="txt">
+        <div class="setlabel">Overscan trim</div>
+        <div class="sethelp" id="tvInsetHelp"></div>
+      </div>
+      <div class="stepper wide">
+        <button id="tviDown" aria-label="Less trim">−</button>
+        <span class="v" id="tviVal">0%</span>
+        <button id="tviUp" aria-label="More trim">+</button>
       </div>
     </div>
 
@@ -874,6 +896,10 @@ const GAP_MIN = 2, GAP_MAX = 10, GAP_DEFAULT = 3;
 /* UI scale. 520 is the design width the layout is capped at, so
    screenWidth/520 is the zoom that makes it exactly fill. */
 const UI_MIN = 0.8, UI_MAX = 2.0, UI_STEP = 0.1, UI_DESIGN_W = 520;
+
+/* TV overscan trim, percent per side. 5 covers almost every panel that
+   crops; 10 is generous headroom for the ones that really do. */
+const TVI_MIN = 0, TVI_MAX = 10, TVI_DEFAULT = 0;
 /* The width the layout actually gets. In TV mode the app is rotated, so the
    space it fills across is the viewport's HEIGHT — measuring innerWidth there
    would fit a 520 px column to a 1920 px edge the app never occupies, and
@@ -1207,7 +1233,7 @@ const PREFS = 'bowlout.prefs';
 
 let prefs = { balls: BALLS_DEFAULT, mode: 'rotation', players: PLAYERS_DEFAULT,
               tiebreaks: TB_DEFAULT, auto: false, gap: GAP_DEFAULT,
-              window: WIN_DEFAULT, sfx: true, ui: null, tv: 'off' };
+              window: WIN_DEFAULT, sfx: true, ui: null, tv: 'off', tvInset: TVI_DEFAULT };
 /* `beep` was a second, separate switch for the auto countdown, and it lived
    in a row that only appeared in auto mode — so the app had one audio
    setting you could find and one you couldn't. sfx now governs everything
@@ -1220,6 +1246,73 @@ try { Object.assign(prefs, JSON.parse(localStorage.getItem(PREFS) || '{}')); } c
    discover the app isn't broken. A phone lands on 1.0 and nothing changes. */
 if(prefs.ui == null) prefs.ui = uiFit();
 
+/* ── TV mode canvas measurement ──────────────────────────────────
+   The rotated canvas has to be EXACTLY the visible viewport with its axes
+   swapped. A canvas one toolbar too tall doesn't scroll — body is fixed and
+   html is overflow:hidden — it just pushes the app's far edge off the
+   screen, which is why shrinking the UI scale doesn't rescue it: the app is
+   sized as a fraction of the canvas, so a canvas that overhangs takes the
+   app with it at every zoom. Measure, don't assume. */
+function measureTV(){
+  if(prefs.tv === 'off') return;
+
+  /* Skip while typing. If the TV ever raises an on-screen keyboard the
+     viewport shrinks under it, and re-measuring there would rotate a
+     half-height canvas into place mid-keystroke. The hardware keyboard
+     never triggers this; a fallback OSK would. */
+  const a = document.activeElement;
+  if(a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA')) return;
+
+  const s = document.documentElement.style;
+  /* Overscan. Plenty of TVs still don't show the outer few percent of the
+     signal — the panel physically crops it, and the browser has no idea:
+     it reports a clean 1920x1080 and is telling the truth about a picture
+     whose edges never reach the glass. No amount of measuring finds that,
+     so it's a dial. Trimming inset% from each side and centring what's left
+     is the same thing broadcast calls a safe area. */
+  const pad = Math.min(TVI_MAX, Math.max(TVI_MIN, prefs.tvInset || 0)) / 100;
+  const mx = Math.round(innerWidth  * pad);
+  const my = Math.round(innerHeight * pad);
+
+  s.setProperty('--tvW', (Math.round(innerHeight) - 2 * my) + 'px'); /* canvas width  = viewport height */
+  s.setProperty('--tvH', (Math.round(innerWidth)  - 2 * mx) + 'px'); /* canvas height = viewport width  */
+  s.setProperty('--tvX', mx + 'px');
+  s.setProperty('--tvY', my + 'px');
+}
+
+/* Fullscreen resizes the viewport asynchronously — the event fires before
+   the new size is readable, so one measurement on the event is always the
+   old one. Measure now, next frame, and once more after the transition has
+   had time to land. Three cheap style writes beats a wrong canvas. */
+let tvTimer = 0;
+function scheduleMeasureTV(){
+  measureTV();
+  requestAnimationFrame(measureTV);
+  clearTimeout(tvTimer);
+  tvTimer = setTimeout(measureTV, 300);
+}
+
+addEventListener('resize', scheduleMeasureTV);
+addEventListener('orientationchange', scheduleMeasureTV);
+document.addEventListener('fullscreenchange', scheduleMeasureTV);
+/* Android reports toolbar show/hide here more reliably than on window
+   resize, and that's exactly the transition that breaks the canvas. */
+if(window.visualViewport) visualViewport.addEventListener('resize', scheduleMeasureTV);
+
+/* Diagnostic for hardware I can't reach. Run __tv() in the TV's console (or
+   just read it out) and every number behind a clipping report is there:
+   what the canvas was told to be vs. what the screen actually is. */
+window.__tv = () => ({
+  tv: prefs.tv, ui: prefs.ui,
+  inner: [innerWidth, innerHeight],
+  visual: window.visualViewport ? [Math.round(visualViewport.width), Math.round(visualViewport.height)] : null,
+  canvas: [getComputedStyle(document.body).width, getComputedStyle(document.body).height],
+  bodyOnScreen: (b => [b.x, b.y, b.width, b.height].map(Math.round))(document.body.getBoundingClientRect()),
+  appOnScreen:  (b => [b.x, b.y, b.width, b.height].map(Math.round))(document.querySelector('.app').getBoundingClientRect()),
+  inset: prefs.tvInset,
+  fullscreen: !!document.fullscreenElement
+});
+
 function applyUI(){
   document.querySelector('.app').style.setProperty('--z', prefs.ui);
 
@@ -1230,6 +1323,13 @@ function applyUI(){
   r.toggle('tv', on);
   r.toggle('tv-cw',  prefs.tv === 'cw');
   r.toggle('tv-ccw', prefs.tv === 'ccw');
+
+  /* Clear the vars when leaving TV mode so a stale canvas size can never
+     apply to a later re-entry at a different viewport. */
+  if(!on){
+    for(const v of ['--tvW','--tvH','--tvX','--tvY'])
+      document.documentElement.style.removeProperty(v);
+  } else scheduleMeasureTV();
 }
 const savePrefs = () => { try { localStorage.setItem(PREFS, JSON.stringify(prefs)); } catch {} };
 
@@ -2105,6 +2205,16 @@ function paintSettings(){
     ? 'Turn the app sideways for a TV stood on its end. Match the direction you turned the panel.'
     : 'Upside-down? Pick the other direction.';
 
+  /* Meaningless when the app isn't rotated, and it would be one more thing
+     to wonder about on a phone. */
+  $('tvInsetRow').hidden = prefs.tv === 'off';
+  $('tviVal').textContent = prefs.tvInset + '%';
+  $('tviDown').disabled = prefs.tvInset <= TVI_MIN;
+  $('tviUp').disabled   = prefs.tvInset >= TVI_MAX;
+  $('tvInsetHelp').textContent = prefs.tvInset
+    ? 'Pulled in ' + prefs.tvInset + '% each side.'
+    : 'Edges cut off by the TV? Raise this until they show.';
+
   $('ballsVal').textContent = prefs.balls;
   $('ballsDown').disabled = prefs.balls <= BALLS_MIN;
   $('ballsUp').disabled   = prefs.balls >= BALLS_MAX;
@@ -2236,6 +2346,13 @@ function setTV(v){
 $('segTvOff').onclick = () => setTV('off');
 $('segTvCw').onclick  = () => setTV('cw');
 $('segTvCcw').onclick = () => setTV('ccw');
+
+function bumpTVI(d){
+  prefs.tvInset = clamp(prefs.tvInset + d, TVI_MIN, TVI_MAX);
+  savePrefs(); measureTV(); paintSettings();
+}
+$('tviUp').onclick   = () => bumpTVI(1);
+$('tviDown').onclick = () => bumpTVI(-1);
 
 $('ballsUp').onclick   = () => { prefs.balls = clamp(prefs.balls+1, BALLS_MIN, BALLS_MAX); savePrefs(); paintSettings(); };
 $('ballsDown').onclick = () => { prefs.balls = clamp(prefs.balls-1, BALLS_MIN, BALLS_MAX); savePrefs(); paintSettings(); };
