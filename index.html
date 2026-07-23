@@ -477,6 +477,41 @@ h1{font-family:var(--disp);font-weight:800;font-size:clamp(34px,10vw,52px);line-
   text-transform:uppercase;color:var(--zing);min-height:15px;margin-top:-8px;
 }
 
+/* ══════════════════════════════════════════════════════════════════
+   TV mode — a portrait app on a landscape panel.
+
+   An Android TV can't be rotated in software: there is no orientation
+   setting and no way for a page to ask for one. So the app rotates
+   itself. Stand the panel on its side, pick the direction that matches,
+   and the whole UI comes up the right way round in true portrait — using
+   the full 1080×1920, not a letterboxed strip.
+
+   The transform goes on <body>, not a new wrapper, for two reasons.
+   body is already the parent of all four top-level layers, so nothing in
+   the markup has to move. And a transform makes body the containing block
+   for the position:fixed ones — so #drop, #zing and #conf rotate WITH the
+   app instead of staying welded to the physical screen. (That's the same
+   property the .app scale comment warns about; here it's the point.)
+   .app's own scale(--z) nests inside this quite happily — nested
+   transforms compose, they don't fight.
+
+   Geometry: the body box is laid out at 100vh × 100vw — the portrait
+   canvas — then rotated about its top-left corner, which swings it off
+   screen, then pushed back into frame. Each translate is 100% of the
+   edge that ends up spanning the display, so it's resolution-independent:
+   no magic pixel numbers, correct on 1080p and 4K alike.
+   ══════════════════════════════════════════════════════════════════ */
+html.tv{overflow:hidden}
+html.tv body{
+  position:fixed;top:0;left:0;
+  width:100vh;height:100vw;
+  transform-origin:top left;
+}
+/* Panel turned clockwise — its left edge is now the bottom. */
+html.tv-cw body{transform:rotate(90deg) translateY(-100%)}
+/* Panel turned anticlockwise — its right edge is now the bottom. */
+html.tv-ccw body{transform:rotate(-90deg) translateX(-100%)}
+
 @media (prefers-reduced-motion:reduce){
   *{animation:none!important;transition:none!important}
   #zing.go{opacity:.9}
@@ -553,6 +588,18 @@ h1{font-family:var(--disp);font-weight:800;font-size:clamp(34px,10vw,52px);line-
         <button id="uiDown" aria-label="Smaller UI">−</button>
         <span class="v" id="uiVal">100%</span>
         <button id="uiUp" aria-label="Bigger UI">+</button>
+      </div>
+    </div>
+
+    <div class="setrow col" id="tvRow">
+      <div class="txt" style="width:100%">
+        <div class="setlabel">TV mode</div>
+        <div class="sethelp" id="tvHelp"></div>
+      </div>
+      <div class="seg" role="group" aria-label="TV mode" style="width:100%;margin-top:11px">
+        <button id="segTvOff" aria-pressed="true">Off</button>
+        <button id="segTvCw" aria-pressed="false">Right</button>
+        <button id="segTvCcw" aria-pressed="false">Left</button>
       </div>
     </div>
 
@@ -827,7 +874,13 @@ const GAP_MIN = 2, GAP_MAX = 10, GAP_DEFAULT = 3;
 /* UI scale. 520 is the design width the layout is capped at, so
    screenWidth/520 is the zoom that makes it exactly fill. */
 const UI_MIN = 0.8, UI_MAX = 2.0, UI_STEP = 0.1, UI_DESIGN_W = 520;
-const uiFit = () => Math.min(UI_MAX, Math.max(1, Math.round(innerWidth / UI_DESIGN_W * 10) / 10));
+/* The width the layout actually gets. In TV mode the app is rotated, so the
+   space it fills across is the viewport's HEIGHT — measuring innerWidth there
+   would fit a 520 px column to a 1920 px edge the app never occupies, and
+   every zoom readout would lie by the aspect ratio. Only ever called after
+   prefs exists. */
+const appW = () => (prefs.tv && prefs.tv !== 'off') ? innerHeight : innerWidth;
+const uiFit = () => Math.min(UI_MAX, Math.max(1, Math.round(appW() / UI_DESIGN_W * 10) / 10));
 
 const $ = id => document.getElementById(id);
 
@@ -1154,7 +1207,7 @@ const PREFS = 'bowlout.prefs';
 
 let prefs = { balls: BALLS_DEFAULT, mode: 'rotation', players: PLAYERS_DEFAULT,
               tiebreaks: TB_DEFAULT, auto: false, gap: GAP_DEFAULT,
-              window: WIN_DEFAULT, sfx: true, ui: null };
+              window: WIN_DEFAULT, sfx: true, ui: null, tv: 'off' };
 /* `beep` was a second, separate switch for the auto countdown, and it lived
    in a row that only appeared in auto mode — so the app had one audio
    setting you could find and one you couldn't. sfx now governs everything
@@ -1169,8 +1222,26 @@ if(prefs.ui == null) prefs.ui = uiFit();
 
 function applyUI(){
   document.querySelector('.app').style.setProperty('--z', prefs.ui);
+
+  /* Rotation lives on <html>, above the transformed body, so the class that
+     switches it isn't itself inside the thing being transformed. */
+  const r = document.documentElement.classList;
+  const on = prefs.tv === 'cw' || prefs.tv === 'ccw';
+  r.toggle('tv', on);
+  r.toggle('tv-cw',  prefs.tv === 'cw');
+  r.toggle('tv-ccw', prefs.tv === 'ccw');
 }
 const savePrefs = () => { try { localStorage.setItem(PREFS, JSON.stringify(prefs)); } catch {} };
+
+/* Escape hatch. If TV mode gets switched on somewhere it shouldn't be — a
+   phone, or a panel that turned out to be the other way up — the setting is
+   still reachable, just sideways, which with a remote is a miserable two
+   minutes. Loading ?tv=off puts it back, and persists it, before anything
+   paints. Cheap insurance for a setting that rotates the very control you'd
+   use to undo it. */
+if(new URLSearchParams(location.search).get('tv') === 'off'){
+  prefs.tv = 'off'; savePrefs();
+}
 
 let game = null;
 let armedBallId = null;   /* echoed back by the device; guards late packets */
@@ -1382,7 +1453,12 @@ function confetti(){
   if(matchMedia('(prefers-reduced-motion: reduce)').matches) return;
   const c = $('conf');
   const dpr = Math.min(devicePixelRatio || 1, 2);
-  const W = innerWidth, H = innerHeight;
+  /* The canvas is inset:0 against body, and in TV mode body is the rotated
+     portrait box — so measure body, not the window. Identical to
+     innerWidth/innerHeight when TV mode is off; correctly 1080×1920 instead
+     of 1920×1080 when it's on. Sizing off the window there would drop most
+     of the confetti outside the canvas and stretch what was left. */
+  const W = document.body.clientWidth, H = document.body.clientHeight;
   c.width = W * dpr; c.height = H * dpr;
   c.style.display = 'block';
   const ctx = c.getContext('2d');
@@ -2018,9 +2094,16 @@ function paintSettings(){
   /* Say when it already fills the screen, so nobody keeps pressing + wondering
      why the app stopped getting wider — past the fit point, zoom trades
      content for size instead. */
-  $('uiHelp').textContent = prefs.ui * UI_DESIGN_W >= innerWidth
+  $('uiHelp').textContent = prefs.ui * UI_DESIGN_W >= appW()
     ? 'Filling the screen. More zoom shows less.'
     : 'Scale the whole app.';
+
+  $('segTvOff').setAttribute('aria-pressed', String(prefs.tv === 'off'));
+  $('segTvCw').setAttribute('aria-pressed',  String(prefs.tv === 'cw'));
+  $('segTvCcw').setAttribute('aria-pressed', String(prefs.tv === 'ccw'));
+  $('tvHelp').textContent = prefs.tv === 'off'
+    ? 'Turn the app sideways for a TV stood on its end. Match the direction you turned the panel.'
+    : 'Upside-down? Pick the other direction.';
 
   $('ballsVal').textContent = prefs.balls;
   $('ballsDown').disabled = prefs.balls <= BALLS_MIN;
@@ -2138,6 +2221,21 @@ function bumpUI(d){
 }
 $('uiUp').onclick   = () => bumpUI(1);
 $('uiDown').onclick = () => bumpUI(-1);
+
+/* Rotating swaps which edge the layout has to fill — 1920 across becomes
+   1080 — so a zoom that was auto-fitted to the old edge is now wrong by the
+   aspect ratio. Re-fit, but only if they never chose a size themselves;
+   a deliberate 140% stays 140%. */
+function setTV(v){
+  if(prefs.tv === v) return;
+  const wasFit = prefs.ui === uiFit();
+  prefs.tv = v;
+  if(wasFit) prefs.ui = uiFit();
+  savePrefs(); applyUI(); paintSettings();
+}
+$('segTvOff').onclick = () => setTV('off');
+$('segTvCw').onclick  = () => setTV('cw');
+$('segTvCcw').onclick = () => setTV('ccw');
 
 $('ballsUp').onclick   = () => { prefs.balls = clamp(prefs.balls+1, BALLS_MIN, BALLS_MAX); savePrefs(); paintSettings(); };
 $('ballsDown').onclick = () => { prefs.balls = clamp(prefs.balls-1, BALLS_MIN, BALLS_MAX); savePrefs(); paintSettings(); };
